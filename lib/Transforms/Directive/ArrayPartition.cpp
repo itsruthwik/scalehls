@@ -11,10 +11,21 @@ using namespace mlir;
 using namespace scalehls;
 using namespace hls;
 
+static bool hasLayoutSensitiveReshape(func::FuncOp func) {
+  return func.walk([&](Operation *op) {
+           return isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+                      tensor::CollapseShapeOp, tensor::ExpandShapeOp>(op)
+                      ? WalkResult::interrupt()
+                      : WalkResult::advance();
+         }).wasInterrupted();
+}
+
 static void updateSubFuncs(func::FuncOp func, Builder builder) {
   func.walk([&](func::CallOp op) {
     auto callee = SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr());
     auto subFunc = dyn_cast<func::FuncOp>(callee);
+    if (!subFunc || subFunc.empty())
+      return;
 
     // Set sub-function type.
     auto subResultTypes = op.getResultTypes();
@@ -50,6 +61,14 @@ bool scalehls::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
   if (!arrayType || !arrayType.hasStaticShape() ||
       (int64_t)factors.size() != arrayType.getRank() ||
       (int64_t)kinds.size() != arrayType.getRank())
+    return false;
+
+  // Array partition currently updates affine/vector accesses and function
+  // signatures, but it does not rewrite reshape-like memref users. Skip these
+  // cases rather than producing invalid IR.
+  if (llvm::any_of(array.getUsers(), [](Operation *user) {
+        return isa<memref::CollapseShapeOp, memref::ExpandShapeOp>(user);
+      }))
     return false;
 
   // Walk through each dimension of the current memory.
@@ -92,6 +111,8 @@ bool scalehls::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
   if (updateFuncSignature)
     if (auto func =
             dyn_cast<func::FuncOp>(array.getParentBlock()->getParentOp())) {
+      if (func.empty())
+        return true;
       // Align function type with entry block argument types only if the array
       // is defined as an argument of the function.
       if (!array.getDefiningOp()) {
@@ -196,6 +217,11 @@ getDimAccessMaps(Operation *op, AffineValueMap valueMap, int64_t dim) {
 /// Find the suitable array partition factors and kinds for all arrays in the
 /// targeted function.
 bool scalehls::applyAutoArrayPartition(func::FuncOp func) {
+  if (func.empty())
+    return true;
+  if (hasLayoutSensitiveReshape(func))
+    return true;
+
   // Check whether the input function is pipelined.
   bool funcPipeline = false;
   if (auto attr = getFuncDirective(func))
@@ -350,6 +376,8 @@ bool scalehls::applyAutoArrayPartition(func::FuncOp func) {
     auto callee = SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr());
     auto subFunc = dyn_cast<func::FuncOp>(callee);
     assert(subFunc && "callable is not a function operation");
+    if (subFunc.empty())
+      return;
 
     // Apply array partition to the sub-function.
     applyAutoArrayPartition(subFunc);

@@ -14,6 +14,9 @@ using namespace hls;
 /// Apply function pipelining to the input function, all contained loops are
 /// automatically fully unrolled.
 static bool applyFuncPipelining(func::FuncOp func, int64_t targetII) {
+  if (func.empty())
+    return false;
+
   if (auto directive = getFuncDirective(func))
     if (directive.getDataflow())
       return false;

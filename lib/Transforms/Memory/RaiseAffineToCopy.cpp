@@ -16,6 +16,8 @@ namespace {
 struct RaiseAffineToCopy : public RaiseAffineToCopyBase<RaiseAffineToCopy> {
   void runOnOperation() override {
     auto func = getOperation();
+    if (func.empty())
+      return;
     auto builder = OpBuilder(func);
 
     // Collect all target loop bands.

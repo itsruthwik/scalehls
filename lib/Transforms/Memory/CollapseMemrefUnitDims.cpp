@@ -12,6 +12,33 @@ using namespace mlir;
 using namespace scalehls;
 using namespace hls;
 
+static void syncExternalCalleeTypes(func::FuncOp func) {
+  auto module = func->getParentOfType<ModuleOp>();
+  if (!module)
+    return;
+
+  func.walk([&](func::CallOp call) {
+    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+    if (!callee || !callee.isExternal())
+      return;
+    callee.setType(FunctionType::get(callee.getContext(), call.getOperandTypes(),
+                                     call.getResultTypes()));
+  });
+}
+
+static bool hasCallers(func::FuncOp func) {
+  auto module = func->getParentOfType<ModuleOp>();
+  if (!module)
+    return false;
+
+  return module
+      .walk([&](func::CallOp call) {
+        return call.getCallee() == func.getName() ? WalkResult::interrupt()
+                                                  : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 static LogicalResult collapseMemref(Value memref) {
   auto type = memref.getType().dyn_cast<MemRefType>();
   if (!type)
@@ -62,15 +89,60 @@ static LogicalResult collapseMemref(Value memref) {
 }
 
 namespace {
+template <typename ReshapeOp>
+static void preserveReshapeMemorySpace(ReshapeOp op) {
+  auto srcType = op.getSrcType().template dyn_cast<MemRefType>();
+  auto resultType = op.getResultType().template dyn_cast<MemRefType>();
+  if (!srcType || !resultType ||
+      srcType.getMemorySpace() == resultType.getMemorySpace())
+    return;
+
+  auto newType = MemRefType::get(resultType.getShape(),
+                                 resultType.getElementType(),
+                                 resultType.getLayout(),
+                                 srcType.getMemorySpace());
+  op.getResult().setType(newType);
+}
+
 struct CollapseFuncMemref : public OpRewritePattern<func::FuncOp> {
   using OpRewritePattern<func::FuncOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(func::FuncOp func,
                                 PatternRewriter &rewriter) const override {
     bool hasChanged = false;
-    for (auto arg : func.getArguments())
-      if (succeeded(collapseMemref(arg)))
+    const bool canRewriteSignature = !hasCallers(func);
+    if (func.empty()) {
+      if (!canRewriteSignature)
+        return failure();
+      SmallVector<Type, 8> inputTypes;
+      inputTypes.reserve(func.getNumArguments());
+      for (Type type : func.getArgumentTypes()) {
+        auto memrefType = type.dyn_cast<MemRefType>();
+        if (!memrefType || !memrefType.getLayout().getAffineMap().isIdentity() ||
+            !llvm::any_of(memrefType.getShape(),
+                          [](int64_t dimSize) { return dimSize == 1; })) {
+          inputTypes.push_back(type);
+          continue;
+        }
+
+        SmallVector<int64_t> newShape;
+        for (int64_t dimSize : memrefType.getShape())
+          if (dimSize != 1)
+            newShape.push_back(dimSize);
+        inputTypes.push_back(MemRefType::get(newShape, memrefType.getElementType(),
+                                             AffineMap(), memrefType.getMemorySpace()));
         hasChanged = true;
+      }
+      if (hasChanged)
+        func.setType(
+            rewriter.getFunctionType(inputTypes, func.getResultTypes()));
+      return success(hasChanged);
+    }
+
+    if (canRewriteSignature)
+      for (auto arg : func.getArguments())
+        if (succeeded(collapseMemref(arg)))
+          hasChanged = true;
 
     func.walk([&](hls::BufferLikeInterface buffer) {
       if (succeeded(collapseMemref(buffer.getMemref()))) {
@@ -88,9 +160,11 @@ struct CollapseFuncMemref : public OpRewritePattern<func::FuncOp> {
       }
     });
 
-    func.setType(rewriter.getFunctionType(
-        func.front().getArgumentTypes(),
-        func.front().getTerminator()->getOperandTypes()));
+    syncExternalCalleeTypes(func);
+    if (canRewriteSignature)
+      func.setType(rewriter.getFunctionType(
+          func.front().getArgumentTypes(),
+          func.front().getTerminator()->getOperandTypes()));
     return success(hasChanged);
   }
 };
@@ -106,6 +180,8 @@ struct CollapseMemrefUnitDims
     mlir::RewritePatternSet patterns(context);
     patterns.add<CollapseFuncMemref>(context);
     (void)applyOpPatternsAndFold(func, std::move(patterns));
+    func.walk([](memref::CollapseShapeOp op) { preserveReshapeMemorySpace(op); });
+    func.walk([](memref::ExpandShapeOp op) { preserveReshapeMemorySpace(op); });
   }
 };
 } // namespace

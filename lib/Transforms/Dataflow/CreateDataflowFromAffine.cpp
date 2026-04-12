@@ -68,6 +68,8 @@ struct CreateDataflowFromAffine
     : public CreateDataflowFromAffineBase<CreateDataflowFromAffine> {
   void runOnOperation() override {
     auto func = getOperation();
+    if (func.empty())
+      return;
     auto context = func.getContext();
 
     dispatchBlock(&func.front());

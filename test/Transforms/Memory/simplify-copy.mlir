@@ -343,7 +343,7 @@ module attributes {torch.debug_module_name = "ResNet"} {
 // CHECK: }
 
 module attributes {torch.debug_module_name = "ResNet"} {
-  func.func @forward(%arg0: memref<1x64x56x56xi8>, %arg1: memref<1000x64xi8>, %arg2: memref<64x64x1x1xi8>, %arg3: memref<64x64x3x3xi8>, %arg4: memref<64x64x3x3xi8>, %arg5: memref<1x1000xi8>) attributes {top_func} {
+func.func @forward(%arg0: memref<1x64x56x56xi8>, %arg1: memref<1000x64xi8>, %arg2: memref<64x64x1x1xi8>, %arg3: memref<64x64x3x3xi8>, %arg4: memref<64x64x3x3xi8>, %arg5: memref<1x1000xi8>) attributes {top_func} {
     %c-24_i8 = arith.constant -24 : i8
     hls.dataflow.dispatch {
       hls.dataflow.task {
@@ -464,4 +464,33 @@ module attributes {torch.debug_module_name = "ResNet"} {
     }
     return
   }
+}
+
+// -----
+
+// CHECK-LABEL: func.func @preserve_const_buffer_broadcast
+// CHECK: %[[CONST:.*]] = hls.dataflow.const_buffer
+// CHECK: hls.dataflow.dispatch {
+// CHECK:   hls.dataflow.task {
+// CHECK:     %[[TMP:.*]] = hls.dataflow.buffer {depth = 1 : i32} : memref<4xf32>
+// CHECK:     memref.copy %[[CONST]], %[[TMP]] : memref<4xf32> to memref<4xf32>
+// CHECK:     linalg.generic
+// CHECK-SAME: ins(%[[TMP]] : memref<4xf32>) outs(%[[TMP]] : memref<4xf32>)
+// CHECK:   }
+// CHECK: }
+func.func @preserve_const_buffer_broadcast() {
+  %cst = arith.constant 1.000000e+00 : f32
+  %0 = "hls.dataflow.const_buffer"() {value = dense<1.000000e+00> : tensor<4xf32>} : () -> memref<4xf32>
+  hls.dataflow.dispatch {
+    hls.dataflow.task {
+      %1 = hls.dataflow.buffer {depth = 1 : i32} : memref<4xf32>
+      memref.copy %0, %1 : memref<4xf32> to memref<4xf32>
+      linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%1 : memref<4xf32>) outs(%1 : memref<4xf32>) {
+      ^bb0(%in: f32, %out: f32):
+        %2 = arith.addf %in, %cst : f32
+        linalg.yield %2 : f32
+      }
+    }
+  }
+  return
 }

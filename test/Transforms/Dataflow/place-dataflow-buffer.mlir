@@ -240,3 +240,15 @@ module attributes {torch.debug_module_name = "ResNet"} {
   }
 }
 
+func.func @preserve_collapse_shape_memory_space(%arg0: memref<1x512x1x1xf32>, %arg1: memref<1x10xf32>) {
+  hls.dataflow.dispatch {
+    %0 = hls.dataflow.buffer {depth = 1 : i32} : memref<1x512x1x1xf32>
+    memref.copy %arg0, %0 : memref<1x512x1x1xf32> to memref<1x512x1x1xf32>
+    %collapsed = memref.collapse_shape %0 [[0], [1, 2, 3]] : memref<1x512x1x1xf32> into memref<1x512xf32>
+    %1 = hls.dataflow.buffer {depth = 1 : i32} : memref<512x10xf32>
+    %2 = hls.dataflow.buffer {depth = 1 : i32, init_value = 0.000000e+00 : f32} : memref<1x10xf32>
+    linalg.matmul ins(%collapsed, %1 : memref<1x512xf32>, memref<512x10xf32>) outs(%2 : memref<1x10xf32>)
+    memref.copy %2, %arg1 : memref<1x10xf32> to memref<1x10xf32>
+  }
+  return
+}

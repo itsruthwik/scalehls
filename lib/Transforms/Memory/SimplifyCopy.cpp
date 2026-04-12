@@ -26,6 +26,10 @@ struct SplitElementwiseGenericOp : public OpRewritePattern<linalg::GenericOp> {
         op.getNumOutputs() == 1) {
       auto &input = op->getOpOperand(0);
       auto &output = op->getOpOperand(1);
+      if (input.get().getType() != output.get().getType())
+        return failure();
+      if (op.getMatchingIndexingMap(&input) != op.getMatchingIndexingMap(&output))
+        return failure();
       if (input.get() == output.get())
         return failure();
 
@@ -157,6 +161,8 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
     // analyzing whether the source view can be replaced to the location of the
     // target buffer.
     if (targetBuf && targetBuf == targetView &&
+        !(isa_and_nonnull<ConstBufferOp>(sourceView) &&
+          hasWriteUsers(targetUsers)) &&
         (!sourceView || llvm::all_of(targetUsers, [&](Operation *user) {
           return domInfo.dominates(sourceView, user);
         }))) {
@@ -169,6 +175,8 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
 
     // Similarly, we need the same conditions to replace the source buffer.
     if (sourceBuf && sourceBuf == sourceView &&
+        !(isa_and_nonnull<ConstBufferOp>(targetView) &&
+          hasWriteUsers(sourceUsers)) &&
         (!targetView || llvm::all_of(sourceUsers, [&](Operation *user) {
           return domInfo.dominates(targetView, user);
         }))) {

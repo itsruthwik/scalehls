@@ -13,6 +13,35 @@ using namespace mlir;
 using namespace scalehls;
 using namespace hls;
 
+static void syncExternalCalleeTypes(func::FuncOp func) {
+  auto module = func->getParentOfType<ModuleOp>();
+  if (!module)
+    return;
+
+  func.walk([&](func::CallOp call) {
+    auto callee = module.lookupSymbol<func::FuncOp>(call.getCallee());
+    if (!callee || !callee.isExternal())
+      return;
+    callee.setType(FunctionType::get(callee.getContext(), call.getOperandTypes(),
+                                     call.getResultTypes()));
+  });
+}
+
+template <typename ReshapeOp>
+static void preserveReshapeMemorySpace(ReshapeOp op) {
+  auto srcType = op.getSrcType().template dyn_cast<MemRefType>();
+  auto resultType = op.getResultType().template dyn_cast<MemRefType>();
+  if (!srcType || !resultType ||
+      srcType.getMemorySpace() == resultType.getMemorySpace())
+    return;
+
+  auto newType = MemRefType::get(resultType.getShape(),
+                                 resultType.getElementType(),
+                                 resultType.getLayout(),
+                                 srcType.getMemorySpace());
+  op.getResult().setType(newType);
+}
+
 namespace {
 struct PlaceBuffer : public OpRewritePattern<func::FuncOp> {
   PlaceBuffer(MLIRContext *context, bool placeExternalBuffer)
@@ -40,13 +69,23 @@ struct PlaceBuffer : public OpRewritePattern<func::FuncOp> {
 
   LogicalResult matchAndRewrite(func::FuncOp func,
                                 PatternRewriter &rewriter) const override {
+    bool hasChanged = false;
+    if (func.empty()) {
+      // Keep external declarations stable here. Their signatures must be driven
+      // by actual call sites after buffer placement, not blindly promoted.
+      return failure();
+    }
+
     for (auto arg : func.getArguments())
-      if (auto type = arg.getType().dyn_cast<MemRefType>())
+      if (auto type = arg.getType().dyn_cast<MemRefType>()) {
         arg.setType(getPlacedOnDramType(type));
+        hasChanged = true;
+      }
 
     func.walk([&](hls::BufferLikeInterface buffer) {
       buffer.getMemref().setType(getPlacedType(
           buffer.getMemrefType(), isa<ConstBufferOp>(buffer.getOperation())));
+      hasChanged = true;
     });
 
     func.walk([](YieldOp yield) {
@@ -55,10 +94,14 @@ struct PlaceBuffer : public OpRewritePattern<func::FuncOp> {
         std::get<0>(t).setType(std::get<1>(t));
     });
 
+    func.walk([](memref::CollapseShapeOp op) { preserveReshapeMemorySpace(op); });
+    func.walk([](memref::ExpandShapeOp op) { preserveReshapeMemorySpace(op); });
+
+    syncExternalCalleeTypes(func);
     func.setType(rewriter.getFunctionType(
         func.front().getArgumentTypes(),
         func.front().getTerminator()->getOperandTypes()));
-    return success();
+    return success(hasChanged);
   }
 
 private:
@@ -107,6 +150,9 @@ struct PlaceDataflowBuffer
     patterns.clear();
     patterns.add<HoistDramBuffer>(context);
     (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+
+    func.walk([](memref::CollapseShapeOp op) { preserveReshapeMemorySpace(op); });
+    func.walk([](memref::ExpandShapeOp op) { preserveReshapeMemorySpace(op); });
   }
 };
 } // namespace

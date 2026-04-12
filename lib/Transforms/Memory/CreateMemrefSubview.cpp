@@ -184,6 +184,8 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band) {
 /// memref and replace all uses.
 void CreateMemrefSubview::runOnOperation() {
   auto func = getOperation();
+  if (func.empty())
+    return;
 
   // Collect all target loop bands.
   AffineLoopBands targetBands;

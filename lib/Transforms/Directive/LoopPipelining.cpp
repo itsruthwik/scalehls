@@ -61,6 +61,9 @@ bool scalehls::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
 namespace {
 struct LoopPipelining : public LoopPipeliningBase<LoopPipelining> {
   void runOnOperation() override {
+    if (getOperation().empty())
+      return;
+
     // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);

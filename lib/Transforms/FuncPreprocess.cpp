@@ -147,6 +147,9 @@ bool scalehls::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
   // auto builder = OpBuilder(func);
   auto context = func.getContext();
 
+  if (func.empty())
+    return true;
+
   // We constrain functions to only contain one block.
   if (!llvm::hasSingleElement(func))
     func.emitError("has more than one basic blocks.");

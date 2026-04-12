@@ -172,6 +172,9 @@ namespace {
 struct AffineLoopPerfection
     : public AffineLoopPerfectionBase<AffineLoopPerfection> {
   void runOnOperation() override {
+    if (getOperation().empty())
+      return;
+
     // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
