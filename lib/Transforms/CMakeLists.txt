@@ -1,4 +1,8 @@
 add_mlir_library(MLIRScaleHLSTransforms
+  Accel/ExportAccelReport.cpp
+  Accel/LowerAffineToAccel.cpp
+  Accel/LowerAccelToCalls.cpp
+  Accel/LowerLinalgToAccel.cpp
   Dataflow/BalanceDataflowNode.cpp
   Dataflow/BufferizeDataflow.cpp
   Dataflow/ConvertDataflowToFunc.cpp
@@ -46,7 +50,6 @@ add_mlir_library(MLIRScaleHLSTransforms
   Tensor/LinalgFakeQuantize.cpp
   Tensor/TosaFakeQuantize.cpp
   Tensor/TosaSimplifyGraph.cpp
-
   DesignSpaceExplore.cpp
   FuncDuplication.cpp
   FuncPreprocess.cpp

@@ -39,6 +39,18 @@ def FuncDuplication : Pass<"scalehls-func-duplication", "mlir::ModuleOp"> {
   let constructor = "mlir::scalehls::createFuncDuplicationPass()";
 }
 
+def ExportAccelReport : Pass<"export-accel-report", "ModuleOp"> {
+  let summary = "Export accelerator manifests for mapped kernels and a candidate log";
+  let constructor = "mlir::scalehls::createExportAccelReportPass()";
+
+  let options = [
+    Option<"manifestDir", "manifest-dir", "std::string", /*default=*/"\"\"",
+           "Directory for per-mapped-accelerator manifest JSON files">,
+    Option<"candidateLog", "candidate-log", "std::string", /*default=*/"\"\"",
+           "Path for aggregate accelerator candidate log JSON file">
+  ];
+}
+
 def FuncPreprocess : Pass<"scalehls-func-preprocess", "func::FuncOp"> {
   let summary = "Preprocess the functions subsequent ScaleHLS optimizations";
   let constructor = "mlir::scalehls::createFuncPreprocessPass()";
@@ -191,6 +203,30 @@ def ConvertTensorToLinalg :
 def LinalgAnalyzeModel : Pass<"scalehls-linalg-analyze-model", "func::FuncOp"> {
   let summary = "Analyze the operation number of a linalg model";
   let constructor = "mlir::scalehls::createLinalgAnalyzeModelPass()";
+}
+
+def LowerLinalgToAccel :
+      Pass<"lower-linalg-to-accel", "func::FuncOp"> {
+  let summary = "Lower mapped tensor/linalg family patterns into accel dialect ops";
+  let constructor = "mlir::scalehls::createLowerLinalgToAccelPass()";
+}
+
+def LowerAffineToAccel :
+      Pass<"lower-affine-to-accel", "func::FuncOp"> {
+  let summary = "Lower strict affine GEMM patterns into accel dialect ops";
+  let constructor = "mlir::scalehls::createLowerAffineToAccelPass()";
+}
+
+def LowerAccelToCalls :
+      Pass<"lower-accel-to-calls", "mlir::ModuleOp"> {
+  let summary = "Lower accel dialect ops into selected physical ABI form";
+  let constructor = "mlir::scalehls::createLowerAccelToCallsPass()";
+  let options = [
+    Option<"abiMode", "abi-mode", "std::string", /*default=*/"\"pointer\"",
+           "Physical ABI lowering mode: pointer, full-data, or stream">,
+    Option<"maxElements", "max-elements", "unsigned", /*default=*/"0",
+           "Maximum logical output elements for untiled pointer lowering; 0 disables the threshold">
+  ];
 }
 
 def LinalgFakeQuantize : Pass<"scalehls-linalg-fake-quantize", "ModuleOp"> {

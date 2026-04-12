@@ -27,7 +27,9 @@ enum AffineFusionMode { Greedy, ProducerConsumer, Sibling };
 enum CreateSubviewMode { Point, Reduction };
 
 void registerScaleHLSDSEPipeline();
+void registerScaleHLSCAccelPipeline();
 void registerScaleFlowPyTorchPipeline();
+void registerScaleFlowPyTorchAccelPipeline();
 void registerScaleFlowPyTorchPipelinePost();
 void registerScaleFlowCppPipeline();
 void registerTransformsPasses();
@@ -40,6 +42,8 @@ void addSimplifyAffineLoopPasses(OpPassManager &pm);
 std::unique_ptr<Pass>
 createDesignSpaceExplorePass(std::string dseTargetSpec = "");
 std::unique_ptr<Pass> createFuncDuplicationPass();
+std::unique_ptr<Pass> createExportAccelReportPass(std::string manifestDir = "",
+                                                  std::string candidateLog = "");
 std::unique_ptr<Pass>
 createFuncPreprocessPass(std::string hlsTopFunc = "forward");
 
@@ -68,6 +72,10 @@ std::unique_ptr<Pass> createStreamDataflowTaskPass();
 /// Tensor-related passes.
 std::unique_ptr<Pass> createConvertTensorToLinalgPass();
 std::unique_ptr<Pass> createLinalgAnalyzeModelPass();
+std::unique_ptr<Pass> createLowerAffineToAccelPass();
+std::unique_ptr<Pass> createLowerAccelToCallsPass(std::string abiMode = "pointer",
+                                                  unsigned maxElements = 0);
+std::unique_ptr<Pass> createLowerLinalgToAccelPass();
 std::unique_ptr<Pass> createLinalgFakeQuantizePass();
 std::unique_ptr<Pass> createTosaFakeQuantizePass();
 std::unique_ptr<Pass> createTosaSimplifyGraphPass();
