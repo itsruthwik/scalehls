@@ -2,6 +2,7 @@ build
 
 .vscode
 .env
+.venv
 
 **/tmp
 **/cpp_src
@@ -18,3 +19,14 @@ build
 *.log
 *.csv
 *.zip
+
+.codex
+conductor/
+local-docs/
+
+tools/__pycache__/
+py-designs-ml/artifacts/
+py-designs-ml/layers/artifacts/
+test/Validation/
+py-designs-ml/
+c-designs-ml/archive/
