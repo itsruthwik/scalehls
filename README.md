@@ -71,11 +71,6 @@ $ scalehls-opt test_gemm.mlir -debug-only=scalehls \
     | scalehls-translate -scalehls-emit-hlscpp > test_gemm_dse.cpp
 ```
 
-If Python binding is enabled, we provide a `pyscalehls` tool to showcase the `scalehls` Python library:
-```sh
-$ pyscalehls.py test_gemm.c -f test_gemm > test_gemm_pyscalehls.cpp
-```
-
 ## Compiling PyTorch Model
 Install the pre-built [Torch-MLIR](https://github.com/llvm/torch-mlir) front-end:
 ```

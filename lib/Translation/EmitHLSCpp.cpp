@@ -22,13 +22,15 @@ static llvm::cl::opt<bool> emitVitisDirectives("emit-vitis-directives",
 static llvm::cl::opt<bool> enforceFalseDependency("enforce-false-dependency",
                                                   llvm::cl::init(false));
 
+namespace {
+constexpr StringLiteral kABIModeAttr = "scalehls.accelerator_abi_mode";
+}
+
 //===----------------------------------------------------------------------===//
 // Utils
 //===----------------------------------------------------------------------===//
 
-static SmallString<16> getTypeName(Value val) {
-  // Handle memref, tensor, and vector types.
-  auto valType = val.getType();
+static SmallString<16> getTypeName(Type valType) {
   if (auto arrayType = valType.dyn_cast<ShapedType>())
     valType = arrayType.getElementType();
   else if (auto streamType = valType.dyn_cast<StreamType>())
@@ -39,39 +41,46 @@ static SmallString<16> getTypeName(Value val) {
       valType = arrayType.getElementType();
   }
 
-  // Handle float types.
   if (valType.isa<Float32Type>())
     return SmallString<16>("float");
   else if (valType.isa<Float64Type>())
     return SmallString<16>("double");
-
-  // Handle integer types.
   else if (valType.isa<IndexType>())
     return SmallString<16>("int");
   else if (auto intType = valType.dyn_cast<IntegerType>()) {
     if (intType.getWidth() == 1)
       return SmallString<16>("bool");
-    else {
-      std::string signedness = "";
-      if (intType.getSignedness() == IntegerType::SignednessSemantics::Unsigned)
-        signedness = "u";
-
-      // switch (intType.getWidth()) {
-      // case 8:
-      // case 16:
-      // case 32:
-      // case 64:
-      //   return SmallString<16>(signedness + "int" +
-      //                          std::to_string(intType.getWidth()) + "_t");
-      // default:
-      return SmallString<16>("ap_" + signedness + "int<" +
-                             std::to_string(intType.getWidth()) + ">");
-      // }
-    }
-  } else
-    val.getDefiningOp()->emitError("has unsupported type.");
-
+    std::string signedness = "";
+    if (intType.getSignedness() == IntegerType::SignednessSemantics::Unsigned)
+      signedness = "u";
+    return SmallString<16>("ap_" + signedness + "int<" +
+                           std::to_string(intType.getWidth()) + ">");
+  }
   return SmallString<16>();
+}
+
+static SmallString<16> getTypeName(Value val) {
+  auto name = getTypeName(val.getType());
+  if (name.empty())
+    val.getDefiningOp()->emitError("has unsupported type.");
+  return name;
+}
+
+static bool hasFullDataABIModeAttr(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>(kABIModeAttr);
+  return attr && attr.getValue() == "full-data";
+}
+
+static bool isFullDataABIMode(Operation *op) {
+  if (hasFullDataABIModeAttr(op))
+    return true;
+  if (auto callOp = dyn_cast<func::CallOp>(op)) {
+    if (auto module = op->getParentOfType<ModuleOp>()) {
+      if (auto callee = module.lookupSymbol<func::FuncOp>(callOp.getCallee()))
+        return hasFullDataABIModeAttr(callee);
+    }
+  }
+  return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -310,6 +319,7 @@ private:
   void emitLoopDirectives(Operation *op);
   void emitArrayDirectives(Value memref);
   void emitFunctionDirectives(func::FuncOp func, ArrayRef<Value> portList);
+  void emitFunctionDecl(func::FuncOp func);
   void emitFunction(func::FuncOp func);
 };
 } // namespace
@@ -475,16 +485,16 @@ public:
   bool visitOp(memref::StoreOp op) { return emitter.emitStore(op), true; }
   bool visitOp(memref::DeallocOp op) { return true; }
   bool visitOp(memref::CopyOp op) { return emitter.emitMemCpy(op), true; }
-  // bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true;
-  // } bool visitOp(memref::CollapseShapeOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
-  // bool visitOp(memref::ExpandShapeOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
-  // bool visitOp(memref::ReinterpretCastOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
+  bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true; }
+  bool visitOp(memref::CollapseShapeOp op) {
+    return emitter.emitReshape(op), true;
+  }
+  bool visitOp(memref::ExpandShapeOp op) {
+    return emitter.emitReshape(op), true;
+  }
+  bool visitOp(memref::ReinterpretCastOp op) {
+    return emitter.emitReshape(op), true;
+  }
 
 private:
   ModuleEmitter &emitter;
@@ -571,6 +581,18 @@ public:
   bool visitOp(arith::ExtUIOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::ExtSIOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::ExtFOp op) { return emitter.emitAssign(op), true; }
+
+  /// Memref view expressions that materialize as local aliases.
+  bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true; }
+  bool visitOp(memref::CollapseShapeOp op) {
+    return emitter.emitReshape(op), true;
+  }
+  bool visitOp(memref::ExpandShapeOp op) {
+    return emitter.emitReshape(op), true;
+  }
+  bool visitOp(memref::ReinterpretCastOp op) {
+    return emitter.emitReshape(op), true;
+  }
 
 private:
   ModuleEmitter &emitter;
@@ -818,7 +840,7 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   // Handle output arguments.
   for (auto result : op.getResults()) {
     // The address should be passed in for scalar result arguments.
-    if (result.getType().isa<ShapedType>())
+    if (result.getType().isa<ShapedType>() || isFullDataABIMode(op))
       os << ", ";
     else
       os << ", &";
@@ -1872,6 +1894,51 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
   }
 }
 
+void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
+  if (!func.isExternal())
+    return;
+
+  os << "void " << func.getName() << "(\n";
+  addIndent();
+
+  unsigned portIdx = 0;
+  auto emitPortSeparator = [&](unsigned current, unsigned total) {
+    if (current + 1 != total)
+      os << ",\n";
+  };
+
+  unsigned totalPorts = func.getNumArguments() + func.getNumResults();
+  for (auto [argIdx, argType] : llvm::enumerate(func.getArgumentTypes())) {
+    indent();
+    if (auto shapedType = dyn_cast<ShapedType>(argType)) {
+      os << getTypeName(argType) << " arg" << argIdx;
+      for (auto dim : shapedType.getShape())
+        os << "[" << dim << "]";
+    } else if (argType.isa<StreamType>()) {
+      os << "hls::stream<" << getTypeName(argType) << "> &arg" << argIdx;
+    } else {
+      os << getTypeName(argType) << " arg" << argIdx;
+    }
+    emitPortSeparator(portIdx++, totalPorts);
+  }
+
+  for (auto [resultIdx, resultType] : llvm::enumerate(func.getResultTypes())) {
+    indent();
+    if (auto shapedType = dyn_cast<ShapedType>(resultType)) {
+      os << getTypeName(resultType) << " result" << resultIdx;
+      for (auto dim : shapedType.getShape())
+        os << "[" << dim << "]";
+    } else if (isFullDataABIMode(func)) {
+      os << getTypeName(resultType) << " &result" << resultIdx;
+    } else {
+      os << getTypeName(resultType) << " *result" << resultIdx;
+    }
+    emitPortSeparator(portIdx++, totalPorts);
+  }
+  reduceIndent();
+  os << "\n);\n\n";
+}
+
 void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (func.getBlocks().size() != 1)
     emitError(func, "has zero or more than one basic blocks.");
@@ -1975,6 +2042,11 @@ using namespace std;
 
 )XXX";
 
+  for (auto func : module.getOps<func::FuncOp>()) {
+    if (func.isExternal() && !hasRuntimeAttr(func))
+      emitFunctionDecl(func);
+  }
+
   // Emit the multiplication primitive if required.
   if (module.walk([](PrimMulOp op) {
         return op.isPackMul() ? WalkResult::interrupt() : WalkResult::advance();
@@ -2006,7 +2078,7 @@ void pack_mul(int8_t A[2], int8_t B, int16_t C[2]) {
   // Emit remained functions accordingly.
   for (auto &op : *module.getBody()) {
     if (auto func = dyn_cast<func::FuncOp>(op)) {
-      if (!emittedFuncs.count(func) && !hasRuntimeAttr(func))
+      if (!func.isExternal() && !emittedFuncs.count(func) && !hasRuntimeAttr(func))
         emitFunction(func);
     } else if (!isa<ml_program::GlobalOp>(op))
       emitError(&op, "is unsupported operation");
