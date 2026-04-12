@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "scalehls/Dialect/Accel/Accel.h"
 #include "scalehls/Dialect/HLS/HLS.h"
 
 namespace mlir {
@@ -35,6 +36,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     mlir::tensor::TensorDialect,
     mlir::linalg::LinalgDialect,
     mlir::memref::MemRefDialect,
+    mlir::scalehls::accel::AccelDialect,
     mlir::bufferization::BufferizationDialect,
     mlir::AffineDialect,
     mlir::math::MathDialect,
