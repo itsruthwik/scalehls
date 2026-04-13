@@ -3,6 +3,7 @@ add_mlir_library(MLIRScaleHLSTransforms
   Accel/LowerAffineToAccel.cpp
   Accel/LowerAccelToCalls.cpp
   Accel/LowerLinalgToAccel.cpp
+  Accel/TileAccelGemm.cpp
   Dataflow/BalanceDataflowNode.cpp
   Dataflow/BufferizeDataflow.cpp
   Dataflow/ConvertDataflowToFunc.cpp
@@ -39,6 +40,8 @@ add_mlir_library(MLIRScaleHLSTransforms
   Memory/CollapseMemrefUnitDims.cpp
   Memory/CreateLocalBuffer.cpp
   Memory/CreateMemrefSubview.cpp
+  Memory/FoldStaticSubviewIntoAffine.cpp
+  Memory/FoldEmptyTensorToMemrefAlloc.cpp
   Memory/LowerCopyToAffine.cpp
   Memory/RaiseAffineToCopy.cpp
   Memory/ReduceInitialInterval.cpp
