@@ -6,9 +6,11 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "scalehls/Dialect/Accel/Accel.h"
 #include "scalehls/Transforms/Passes.h"
@@ -34,9 +36,11 @@ constexpr StringLiteral kCandidateIndexAttr = "scalehls.gemm_candidate_index";
 
 struct AffineCandidateInfo {
   StringRef family;
+  StringRef sourceFamily;
   Value inputMemref;
   Value weightMemref;
   Value outputMemref;
+  bool hasExistingInput = false;
   SmallVector<int64_t, 4> inputShape;
   SmallVector<int64_t, 4> weightShape;
   SmallVector<int64_t, 4> outputShape;
@@ -48,6 +52,16 @@ static SmallVector<Operation *, 8> getBodyOps(Block &block) {
   SmallVector<Operation *, 8> ops;
   for (Operation &op : block.without_terminator())
     ops.push_back(&op);
+  return ops;
+}
+
+static SmallVector<Operation *, 8> getBodyOpsIgnoringConstants(Block &block) {
+  SmallVector<Operation *, 8> ops;
+  for (Operation &op : block.without_terminator()) {
+    if (isa<arith::ConstantOp>(op))
+      continue;
+    ops.push_back(&op);
+  }
   return ops;
 }
 
@@ -254,6 +268,19 @@ static Value stripIntegerCasts(Value value) {
   }
 }
 
+static bool isZeroInitValue(Value value) {
+  value = stripIntegerCasts(value);
+  if (auto intConst = value.getDefiningOp<arith::ConstantIntOp>())
+    return intConst.value() == 0;
+  if (auto constOp = value.getDefiningOp<arith::ConstantOp>()) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+      return intAttr.getValue().isZero();
+    if (auto floatAttr = dyn_cast<FloatAttr>(constOp.getValue()))
+      return floatAttr.getValue().isZero();
+  }
+  return false;
+}
+
 static bool matchesMulInputs(Value lhs, Value rhs, Value inputValue,
                              Value weightValue) {
   Value strippedLhs = stripIntegerCasts(lhs);
@@ -331,6 +358,370 @@ static bool matchesReductionComputation(ArrayRef<Operation *> ops,
   }
 
   return stripIntegerCasts(store.getValueToStore()) == addValue;
+}
+
+static bool matchesYieldedReductionComputation(ArrayRef<Operation *> ops,
+                                               AffineLoadOp inputLoad,
+                                               AffineLoadOp weightLoad,
+                                               Value accumulator,
+                                               Value yieldedValue) {
+  arith::MulFOp mulf;
+  arith::MulIOp muli;
+  arith::AddFOp addf;
+  arith::AddIOp addi;
+
+  for (Operation *op : ops) {
+    if (isa<AffineLoadOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
+      continue;
+    if (!mulf)
+      mulf = dyn_cast<arith::MulFOp>(op);
+    if (!muli)
+      muli = dyn_cast<arith::MulIOp>(op);
+    if (!addf)
+      addf = dyn_cast<arith::AddFOp>(op);
+    if (!addi)
+      addi = dyn_cast<arith::AddIOp>(op);
+    if (!isa<arith::MulFOp, arith::MulIOp, arith::AddFOp, arith::AddIOp>(op))
+      return false;
+  }
+
+  Value mulValue;
+  if (mulf) {
+    if (!matchesMulInputs(mulf.getLhs(), mulf.getRhs(), inputLoad.getResult(),
+                          weightLoad.getResult()))
+      return false;
+    mulValue = mulf.getResult();
+  } else if (muli) {
+    if (!matchesMulInputs(muli.getLhs(), muli.getRhs(), inputLoad.getResult(),
+                          weightLoad.getResult()))
+      return false;
+    mulValue = muli.getResult();
+  } else {
+    return false;
+  }
+
+  Value addValue;
+  if (addf) {
+    Value lhs = addf.getLhs();
+    Value rhs = addf.getRhs();
+    bool lhsIsAccumulator = stripIntegerCasts(lhs) == accumulator;
+    bool rhsIsAccumulator = stripIntegerCasts(rhs) == accumulator;
+    if (lhsIsAccumulator == rhsIsAccumulator)
+      return false;
+    Value other = lhsIsAccumulator ? rhs : lhs;
+    if (stripIntegerCasts(other) != mulValue)
+      return false;
+    addValue = addf.getResult();
+  } else if (addi) {
+    Value lhs = addi.getLhs();
+    Value rhs = addi.getRhs();
+    bool lhsIsAccumulator = stripIntegerCasts(lhs) == accumulator;
+    bool rhsIsAccumulator = stripIntegerCasts(rhs) == accumulator;
+    if (lhsIsAccumulator == rhsIsAccumulator)
+      return false;
+    Value other = lhsIsAccumulator ? rhs : lhs;
+    if (stripIntegerCasts(other) != mulValue)
+      return false;
+    addValue = addi.getResult();
+  } else {
+    return false;
+  }
+
+  return stripIntegerCasts(yieldedValue) == addValue;
+}
+
+static bool matchIterArgReduction2DCanonical(ArrayRef<Operation *> ops, Value row,
+                                             Value col, Value &inputMemref,
+                                             Value &weightMemref,
+                                             Value &outputMemref,
+                                             bool &hasExistingInput) {
+  if (ops.empty())
+    return false;
+
+  auto outputLoad = dyn_cast<AffineLoadOp>(ops.front());
+  AffineForOp redLoop;
+  for (Operation *op : ops)
+    if (auto loop = dyn_cast<AffineForOp>(op))
+      redLoop = loop;
+  auto store = dyn_cast<AffineStoreOp>(ops.back());
+  if (!outputLoad || !redLoop || !store || redLoop.getNumIterOperands() != 1 ||
+      !isRectangularLoop(redLoop)) {
+    outputLoad = AffineLoadOp();
+    if (!redLoop || !store || redLoop.getNumIterOperands() != 1 ||
+        !isRectangularLoop(redLoop))
+      return false;
+  }
+
+  auto rowCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, row);
+  };
+  auto colCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, col);
+  };
+  if (outputLoad) {
+    if (!sameMemrefAccess(outputLoad, outputLoad.getMemRef(), {rowCheck, colCheck}) ||
+        !sameMemrefAccess(store, outputLoad.getMemRef(), {rowCheck, colCheck}))
+      return false;
+    if (stripIntegerCasts(redLoop.getIterOperands().front()) != outputLoad.getResult())
+      return false;
+    outputMemref = outputLoad.getMemRef();
+    hasExistingInput = true;
+  } else {
+    if (!sameMemrefAccess(store, store.getMemRef(), {rowCheck, colCheck}) ||
+        !isZeroInitValue(redLoop.getIterOperands().front()))
+      return false;
+    outputMemref = store.getMemRef();
+    hasExistingInput = false;
+  }
+  if (stripIntegerCasts(store.getValueToStore()) != redLoop.getResult(0))
+    return false;
+
+  auto redBodyOps = getBodyOps(*redLoop.getBody());
+  SmallVector<AffineLoadOp, 2> loads;
+  for (Operation *op : redBodyOps)
+    if (auto load = dyn_cast<AffineLoadOp>(op))
+      loads.push_back(load);
+  if (loads.size() != 2)
+    return false;
+
+  auto redCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, redLoop.getInductionVar());
+  };
+
+  AffineLoadOp inputLoad;
+  AffineLoadOp weightLoad;
+  for (auto load : loads) {
+    if (sameMemrefAccess(load, load.getMemRef(), {rowCheck, redCheck}))
+      inputLoad = load;
+    else if (sameMemrefAccess(load, load.getMemRef(), {redCheck, colCheck}))
+      weightLoad = load;
+  }
+  if (!inputLoad || !weightLoad)
+    return false;
+
+  auto yield = cast<AffineYieldOp>(redLoop.getBody()->getTerminator());
+  if (!matchesYieldedReductionComputation(redBodyOps, inputLoad, weightLoad,
+                                          redLoop.getRegionIterArgs()[0],
+                                          yield.getOperands()[0]))
+    return false;
+  inputMemref = inputLoad.getMemRef();
+  weightMemref = weightLoad.getMemRef();
+  return inputMemref != weightMemref && inputMemref != outputMemref &&
+         weightMemref != outputMemref;
+}
+
+static bool matchIterArgReduction3DCanonical(ArrayRef<Operation *> ops,
+                                             Value batch, Value row, Value col,
+                                             Value &inputMemref,
+                                             Value &weightMemref,
+                                             Value &outputMemref,
+                                             bool &hasExistingInput) {
+  if (ops.empty())
+    return false;
+  auto outputLoad = dyn_cast<AffineLoadOp>(ops.front());
+  AffineForOp redLoop;
+  for (Operation *op : ops)
+    if (auto loop = dyn_cast<AffineForOp>(op))
+      redLoop = loop;
+  auto store = dyn_cast<AffineStoreOp>(ops.back());
+  if (!outputLoad || !redLoop || !store || redLoop.getNumIterOperands() != 1 ||
+      !isRectangularLoop(redLoop)) {
+    outputLoad = AffineLoadOp();
+    if (!redLoop || !store || redLoop.getNumIterOperands() != 1 ||
+        !isRectangularLoop(redLoop))
+      return false;
+  }
+
+  auto batchCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, batch);
+  };
+  auto rowCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, row);
+  };
+  auto colCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, col);
+  };
+  if (outputLoad) {
+    if (!sameMemrefAccess(outputLoad, outputLoad.getMemRef(),
+                          {batchCheck, rowCheck, colCheck}) ||
+        !sameMemrefAccess(store, outputLoad.getMemRef(),
+                          {batchCheck, rowCheck, colCheck}))
+      return false;
+    if (stripIntegerCasts(redLoop.getIterOperands().front()) != outputLoad.getResult())
+      return false;
+    outputMemref = outputLoad.getMemRef();
+    hasExistingInput = true;
+  } else {
+    if (!sameMemrefAccess(store, store.getMemRef(),
+                          {batchCheck, rowCheck, colCheck}) ||
+        !isZeroInitValue(redLoop.getIterOperands().front()))
+      return false;
+    outputMemref = store.getMemRef();
+    hasExistingInput = false;
+  }
+  if (stripIntegerCasts(store.getValueToStore()) != redLoop.getResult(0))
+    return false;
+
+  auto redBodyOps = getBodyOps(*redLoop.getBody());
+  SmallVector<AffineLoadOp, 2> loads;
+  for (Operation *op : redBodyOps)
+    if (auto load = dyn_cast<AffineLoadOp>(op))
+      loads.push_back(load);
+  if (loads.size() != 2)
+    return false;
+
+  auto redCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, redLoop.getInductionVar());
+  };
+
+  AffineLoadOp inputLoad;
+  AffineLoadOp weightLoad;
+  for (auto load : loads) {
+    if (sameMemrefAccess(load, load.getMemRef(),
+                         {batchCheck, rowCheck, redCheck}))
+      inputLoad = load;
+    else if (sameMemrefAccess(load, load.getMemRef(),
+                              {batchCheck, redCheck, colCheck}))
+      weightLoad = load;
+  }
+  if (!inputLoad || !weightLoad)
+    return false;
+
+  auto yield = cast<AffineYieldOp>(redLoop.getBody()->getTerminator());
+  if (!matchesYieldedReductionComputation(redBodyOps, inputLoad, weightLoad,
+                                          redLoop.getRegionIterArgs()[0],
+                                          yield.getOperands()[0]))
+    return false;
+  inputMemref = inputLoad.getMemRef();
+  weightMemref = weightLoad.getMemRef();
+  return inputMemref != weightMemref && inputMemref != outputMemref &&
+         weightMemref != outputMemref;
+}
+
+static bool matchIterArgReductionConvCanonical(ArrayRef<Operation *> ops,
+                                               Value oc, Value oh, Value ow,
+                                               Value &inputMemref,
+                                               Value &weightMemref,
+                                               Value &outputMemref,
+                                               bool &hasExistingInput) {
+  if (ops.empty())
+    return false;
+  auto outputLoad = dyn_cast<AffineLoadOp>(ops.front());
+  AffineForOp icLoop;
+  for (Operation *op : ops)
+    if (auto loop = dyn_cast<AffineForOp>(op))
+      icLoop = loop;
+  auto store = dyn_cast<AffineStoreOp>(ops.back());
+  if (!outputLoad || !icLoop || !store || icLoop.getNumIterOperands() != 1 ||
+      !isRectangularLoop(icLoop)) {
+    outputLoad = AffineLoadOp();
+    if (!icLoop || !store || icLoop.getNumIterOperands() != 1 ||
+        !isRectangularLoop(icLoop))
+      return false;
+  }
+
+  auto zeroCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, 0);
+  };
+  auto ocCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, oc);
+  };
+  auto ohCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, oh);
+  };
+  auto owCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, ow);
+  };
+  if (outputLoad) {
+    if (!sameMemrefAccess(outputLoad, outputLoad.getMemRef(),
+                          {zeroCheck, ocCheck, ohCheck, owCheck}) ||
+        !sameMemrefAccess(store, outputLoad.getMemRef(),
+                          {zeroCheck, ocCheck, ohCheck, owCheck}))
+      return false;
+    if (stripIntegerCasts(icLoop.getIterOperands().front()) != outputLoad.getResult())
+      return false;
+    outputMemref = outputLoad.getMemRef();
+    hasExistingInput = true;
+  } else {
+    if (!sameMemrefAccess(store, store.getMemRef(),
+                          {zeroCheck, ocCheck, ohCheck, owCheck}) ||
+        !isZeroInitValue(icLoop.getIterOperands().front()))
+      return false;
+    outputMemref = store.getMemRef();
+    hasExistingInput = false;
+  }
+  if (stripIntegerCasts(store.getValueToStore()) != icLoop.getResult(0))
+    return false;
+
+  auto icBodyOps = getBodyOps(*icLoop.getBody());
+  if (icBodyOps.size() != 1 || !isa<AffineForOp>(icBodyOps.front()))
+    return false;
+  auto khLoop = cast<AffineForOp>(icBodyOps.front());
+  if (khLoop.getNumIterOperands() != 1 || !isRectangularLoop(khLoop) ||
+      stripIntegerCasts(khLoop.getIterOperands().front()) != icLoop.getRegionIterArgs()[0])
+    return false;
+
+  auto khBodyOps = getBodyOps(*khLoop.getBody());
+  if (khBodyOps.size() != 1 || !isa<AffineForOp>(khBodyOps.front()))
+    return false;
+  auto kwLoop = cast<AffineForOp>(khBodyOps.front());
+  if (kwLoop.getNumIterOperands() != 1 || !isRectangularLoop(kwLoop) ||
+      stripIntegerCasts(kwLoop.getIterOperands().front()) != khLoop.getRegionIterArgs()[0])
+    return false;
+
+  auto kwBodyOps = getBodyOps(*kwLoop.getBody());
+  SmallVector<AffineLoadOp, 2> loads;
+  for (Operation *op : kwBodyOps)
+    if (auto load = dyn_cast<AffineLoadOp>(op))
+      loads.push_back(load);
+  if (loads.size() != 2)
+    return false;
+
+  auto icCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, icLoop.getInductionVar());
+  };
+  auto khCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, khLoop.getInductionVar());
+  };
+  auto kwCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, kwLoop.getInductionVar());
+  };
+  auto ohPlusKhCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, oh, khLoop.getInductionVar());
+  };
+  auto owPlusKwCheck = [&](AffineExpr expr, ValueRange operands) {
+    return matchesAffineExpr(expr, operands, ow, kwLoop.getInductionVar());
+  };
+
+  AffineLoadOp inputLoad;
+  AffineLoadOp weightLoad;
+  for (auto load : loads) {
+    if (sameMemrefAccess(load, load.getMemRef(),
+                         {zeroCheck, icCheck, ohPlusKhCheck, owPlusKwCheck}))
+      inputLoad = load;
+    else if (sameMemrefAccess(load, load.getMemRef(),
+                              {ocCheck, icCheck, khCheck, kwCheck}))
+      weightLoad = load;
+  }
+  if (!inputLoad || !weightLoad)
+    return false;
+
+  auto kwYield = cast<AffineYieldOp>(kwLoop.getBody()->getTerminator());
+  if (!matchesYieldedReductionComputation(kwBodyOps, inputLoad, weightLoad,
+                                          kwLoop.getRegionIterArgs()[0],
+                                          kwYield.getOperands()[0]))
+    return false;
+
+  auto khYield = cast<AffineYieldOp>(khLoop.getBody()->getTerminator());
+  auto icYield = cast<AffineYieldOp>(icLoop.getBody()->getTerminator());
+  if (stripIntegerCasts(khYield.getOperands()[0]) != kwLoop.getResult(0) ||
+      stripIntegerCasts(icYield.getOperands()[0]) != khLoop.getResult(0))
+    return false;
+
+  inputMemref = inputLoad.getMemRef();
+  weightMemref = weightLoad.getMemRef();
+  return inputMemref != weightMemref && inputMemref != outputMemref &&
+         weightMemref != outputMemref;
 }
 
 static bool matchStoreStyleReduction2D(ArrayRef<Operation *> ops, Value row,
@@ -870,6 +1261,8 @@ static LogicalResult matchStripMinedGEMMV(func::FuncOp func,
       return failure();
 
   info.family = StringRef("GEMMV");
+  info.sourceFamily = info.family;
+  info.hasExistingInput = true;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
   info.outputMemref = outputStore.getMemRef();
@@ -947,6 +1340,8 @@ static LogicalResult matchStripMinedGEMM(func::FuncOp func,
       return failure();
 
   info.family = StringRef("GEMM");
+  info.sourceFamily = info.family;
+  info.hasExistingInput = true;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
   info.outputMemref = outputStore.getMemRef();
@@ -1057,6 +1452,8 @@ static LogicalResult matchStripMinedCONV(func::FuncOp func,
       return failure();
 
   info.family = StringRef("CONV");
+  info.sourceFamily = info.family;
+  info.hasExistingInput = true;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
   info.outputMemref = outputStore.getMemRef();
@@ -1080,7 +1477,7 @@ static LogicalResult matchStripMinedCONV(func::FuncOp func,
 
 static LogicalResult matchCanonicalGEMMV(func::FuncOp func,
                                          AffineCandidateInfo &info) {
-  auto bodyOps = getBodyOps(func.front());
+  auto bodyOps = getBodyOpsIgnoringConstants(func.front());
   if (bodyOps.size() != 1 || !isa<AffineForOp>(bodyOps.front()))
     return failure();
 
@@ -1095,46 +1492,62 @@ static LogicalResult matchCanonicalGEMMV(func::FuncOp func,
   if (!isRectangularLoop(colLoop))
     return failure();
   auto colOps = getBodyOps(*colLoop.getBody());
-  if (colOps.size() != 1 || !isa<AffineForOp>(colOps.front()))
-    return failure();
-
-  auto redLoop = cast<AffineForOp>(colOps.front());
-  if (!isRectangularLoop(redLoop))
-    return failure();
-
+  int64_t reductionExtent = -1;
   Value inputMemref;
   Value weightMemref;
-  auto redOps = getBodyOps(*redLoop.getBody());
-  auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
-  if (!outputStore)
-    return failure();
-  if (!matchStoreStyleReduction2D(redOps, rowLoop.getInductionVar(),
-                                  colLoop.getInductionVar(),
-                                  redLoop.getInductionVar(),
-                                  outputStore.getMemRef(), inputMemref,
-                                  weightMemref))
-    if (!matchStoreStyleReduction2DLinearized(redOps, rowLoop.getInductionVar(),
-                                              colLoop.getInductionVar(),
-                                              redLoop.getInductionVar(),
-                                              colLoop.getConstantUpperBound(),
-                                              redLoop.getConstantUpperBound(),
-                                              outputStore.getMemRef(),
-                                              inputMemref, weightMemref))
+  Value outputMemref;
+  if (colOps.size() == 1 && isa<AffineForOp>(colOps.front())) {
+    auto redLoop = cast<AffineForOp>(colOps.front());
+    if (!isRectangularLoop(redLoop))
       return failure();
+    auto redOps = getBodyOps(*redLoop.getBody());
+    auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
+    if (!outputStore)
+      return failure();
+    if (!matchStoreStyleReduction2D(redOps, rowLoop.getInductionVar(),
+                                    colLoop.getInductionVar(),
+                                    redLoop.getInductionVar(),
+                                    outputStore.getMemRef(), inputMemref,
+                                    weightMemref))
+      if (!matchStoreStyleReduction2DLinearized(
+              redOps, rowLoop.getInductionVar(), colLoop.getInductionVar(),
+              redLoop.getInductionVar(), colLoop.getConstantUpperBound(),
+              redLoop.getConstantUpperBound(), outputStore.getMemRef(),
+              inputMemref, weightMemref))
+        return failure();
+    reductionExtent = redLoop.getConstantUpperBound();
+    outputMemref = outputStore.getMemRef();
+  } else if (!matchIterArgReduction2DCanonical(colOps, rowLoop.getInductionVar(),
+                                               colLoop.getInductionVar(),
+                                               inputMemref, weightMemref,
+                                               outputMemref,
+                                               info.hasExistingInput)) {
+    return failure();
+  }
 
   info.family = StringRef("GEMMV");
+  info.sourceFamily = info.family;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
-  info.outputMemref = outputStore.getMemRef();
-  info.inputShape = {rowLoop.getConstantUpperBound(), redLoop.getConstantUpperBound()};
-  info.weightShape = {redLoop.getConstantUpperBound(), colLoop.getConstantUpperBound()};
+  info.outputMemref = outputMemref;
+  auto inputType = cast<MemRefType>(inputMemref.getType());
+  auto weightType = cast<MemRefType>(weightMemref.getType());
+  int64_t kExtent = reductionExtent;
+  if (kExtent < 0) {
+    if (inputType.getRank() > 1 && inputType.hasStaticShape())
+      kExtent = inputType.getShape().back();
+    else if (weightType.getRank() > 1 && weightType.hasStaticShape())
+      kExtent = weightType.getShape().front();
+  }
+  info.inputShape = {rowLoop.getConstantUpperBound(), kExtent};
+  info.weightShape = {kExtent, colLoop.getConstantUpperBound()};
   info.outputShape = {rowLoop.getConstantUpperBound(), colLoop.getConstantUpperBound()};
   return success();
 }
 
 static LogicalResult matchCanonicalGEMM(func::FuncOp func,
                                         AffineCandidateInfo &info) {
-  auto bodyOps = getBodyOps(func.front());
+  auto bodyOps = getBodyOpsIgnoringConstants(func.front());
   if (bodyOps.size() != 1 || !isa<AffineForOp>(bodyOps.front()))
     return failure();
 
@@ -1156,40 +1569,57 @@ static LogicalResult matchCanonicalGEMM(func::FuncOp func,
   if (!isRectangularLoop(colLoop))
     return failure();
   auto colOps = getBodyOps(*colLoop.getBody());
-  if (colOps.size() != 1 || !isa<AffineForOp>(colOps.front()))
-    return failure();
-
-  auto redLoop = cast<AffineForOp>(colOps.front());
-  if (!isRectangularLoop(redLoop))
-    return failure();
-
+  int64_t reductionExtent = -1;
   Value inputMemref;
   Value weightMemref;
-  auto redOps = getBodyOps(*redLoop.getBody());
-  auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
-  if (!outputStore)
+  Value outputMemref;
+  if (colOps.size() == 1 && isa<AffineForOp>(colOps.front())) {
+    auto redLoop = cast<AffineForOp>(colOps.front());
+    if (!isRectangularLoop(redLoop))
+      return failure();
+    auto redOps = getBodyOps(*redLoop.getBody());
+    auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
+    if (!outputStore)
+      return failure();
+    if (!matchStoreStyleReduction3D(redOps, batchLoop.getInductionVar(),
+                                    rowLoop.getInductionVar(),
+                                    colLoop.getInductionVar(),
+                                    redLoop.getInductionVar(),
+                                    outputStore.getMemRef(), inputMemref,
+                                    weightMemref))
+      if (!matchStoreStyleReduction3DLinearized(
+              redOps, batchLoop.getInductionVar(), rowLoop.getInductionVar(),
+              colLoop.getInductionVar(), redLoop.getInductionVar(),
+              rowLoop.getConstantUpperBound(), colLoop.getConstantUpperBound(),
+              redLoop.getConstantUpperBound(), outputStore.getMemRef(),
+              inputMemref, weightMemref))
+        return failure();
+    reductionExtent = redLoop.getConstantUpperBound();
+    outputMemref = outputStore.getMemRef();
+  } else if (!matchIterArgReduction3DCanonical(
+                 colOps, batchLoop.getInductionVar(), rowLoop.getInductionVar(),
+                 colLoop.getInductionVar(), inputMemref, weightMemref,
+                 outputMemref, info.hasExistingInput)) {
     return failure();
-  if (!matchStoreStyleReduction3D(redOps, batchLoop.getInductionVar(),
-                                  rowLoop.getInductionVar(),
-                                  colLoop.getInductionVar(),
-                                  redLoop.getInductionVar(),
-                                  outputStore.getMemRef(), inputMemref,
-                                  weightMemref))
-    if (!matchStoreStyleReduction3DLinearized(
-            redOps, batchLoop.getInductionVar(), rowLoop.getInductionVar(),
-            colLoop.getInductionVar(), redLoop.getInductionVar(),
-            rowLoop.getConstantUpperBound(), colLoop.getConstantUpperBound(),
-            redLoop.getConstantUpperBound(), outputStore.getMemRef(),
-            inputMemref, weightMemref))
-    return failure();
+  }
 
   info.family = StringRef("GEMM");
+  info.sourceFamily = info.family;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
-  info.outputMemref = outputStore.getMemRef();
+  info.outputMemref = outputMemref;
+  auto inputType = cast<MemRefType>(inputMemref.getType());
+  auto weightType = cast<MemRefType>(weightMemref.getType());
+  int64_t kExtent = reductionExtent;
+  if (kExtent < 0) {
+    if (inputType.getRank() > 2 && inputType.hasStaticShape())
+      kExtent = inputType.getShape().back();
+    else if (weightType.getRank() > 2 && weightType.hasStaticShape())
+      kExtent = weightType.getShape()[1];
+  }
   info.inputShape = {batchLoop.getConstantUpperBound(), rowLoop.getConstantUpperBound(),
-                     redLoop.getConstantUpperBound()};
-  info.weightShape = {batchLoop.getConstantUpperBound(), redLoop.getConstantUpperBound(),
+                     kExtent};
+  info.weightShape = {batchLoop.getConstantUpperBound(), kExtent,
                       colLoop.getConstantUpperBound()};
   info.outputShape = {batchLoop.getConstantUpperBound(), rowLoop.getConstantUpperBound(),
                       colLoop.getConstantUpperBound()};
@@ -1198,7 +1628,7 @@ static LogicalResult matchCanonicalGEMM(func::FuncOp func,
 
 static LogicalResult matchCanonicalCONV(func::FuncOp func,
                                         AffineCandidateInfo &info) {
-  auto bodyOps = getBodyOps(func.front());
+  auto bodyOps = getBodyOpsIgnoringConstants(func.front());
   if (bodyOps.size() != 1 || !isa<AffineForOp>(bodyOps.front()))
     return failure();
   auto ocLoop = cast<AffineForOp>(bodyOps.front());
@@ -1220,62 +1650,67 @@ static LogicalResult matchCanonicalCONV(func::FuncOp func,
     return failure();
 
   auto owOps = getBodyOps(*owLoop.getBody());
-  if (owOps.size() != 1 || !isa<AffineForOp>(owOps.front()))
-    return failure();
-  auto icLoop = cast<AffineForOp>(owOps.front());
-  if (!isRectangularLoop(icLoop))
-    return failure();
-
-  auto icOps = getBodyOps(*icLoop.getBody());
-  if (icOps.size() != 1 || !isa<AffineForOp>(icOps.front()))
-    return failure();
-  auto khLoop = cast<AffineForOp>(icOps.front());
-  if (!isRectangularLoop(khLoop))
-    return failure();
-
-  auto khOps = getBodyOps(*khLoop.getBody());
-  if (khOps.size() != 1 || !isa<AffineForOp>(khOps.front()))
-    return failure();
-  auto kwLoop = cast<AffineForOp>(khOps.front());
-  if (!isRectangularLoop(kwLoop))
-    return failure();
-
   Value inputMemref;
   Value weightMemref;
-  auto redOps = getBodyOps(*kwLoop.getBody());
-  auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
-  if (!outputStore)
+  Value outputMemref;
+  if (owOps.size() == 1 && isa<AffineForOp>(owOps.front())) {
+    auto icLoop = cast<AffineForOp>(owOps.front());
+    if (!isRectangularLoop(icLoop))
+      return failure();
+    auto icOps = getBodyOps(*icLoop.getBody());
+    if (icOps.size() != 1 || !isa<AffineForOp>(icOps.front()))
+      return failure();
+    auto khLoop = cast<AffineForOp>(icOps.front());
+    if (!isRectangularLoop(khLoop))
+      return failure();
+    auto khOps = getBodyOps(*khLoop.getBody());
+    if (khOps.size() != 1 || !isa<AffineForOp>(khOps.front()))
+      return failure();
+    auto kwLoop = cast<AffineForOp>(khOps.front());
+    if (!isRectangularLoop(kwLoop))
+      return failure();
+
+    auto redOps = getBodyOps(*kwLoop.getBody());
+    auto outputStore = dyn_cast<AffineStoreOp>(redOps.back());
+    if (!outputStore)
+      return failure();
+    if (!matchStoreStyleReductionConv(redOps, ocLoop.getInductionVar(),
+                                      ohLoop.getInductionVar(),
+                                      owLoop.getInductionVar(),
+                                      icLoop.getInductionVar(),
+                                      khLoop.getInductionVar(),
+                                      kwLoop.getInductionVar(),
+                                      outputStore.getMemRef(), inputMemref,
+                                      weightMemref))
+      if (!matchStoreStyleReductionConvLinearized(
+              redOps, ocLoop.getInductionVar(), ohLoop.getInductionVar(),
+              owLoop.getInductionVar(), icLoop.getInductionVar(),
+              khLoop.getInductionVar(), kwLoop.getInductionVar(),
+              icLoop.getConstantUpperBound(),
+              ohLoop.getConstantUpperBound() + khLoop.getConstantUpperBound() - 1,
+              owLoop.getConstantUpperBound() + kwLoop.getConstantUpperBound() - 1,
+              ocLoop.getConstantUpperBound(), ohLoop.getConstantUpperBound(),
+              owLoop.getConstantUpperBound(), khLoop.getConstantUpperBound(),
+              kwLoop.getConstantUpperBound(), outputStore.getMemRef(),
+              inputMemref, weightMemref))
+        return failure();
+    outputMemref = outputStore.getMemRef();
+  } else if (!matchIterArgReductionConvCanonical(
+                 owOps, ocLoop.getInductionVar(), ohLoop.getInductionVar(),
+                 owLoop.getInductionVar(), inputMemref, weightMemref,
+                 outputMemref, info.hasExistingInput)) {
     return failure();
-  if (!matchStoreStyleReductionConv(redOps, ocLoop.getInductionVar(),
-                                    ohLoop.getInductionVar(),
-                                    owLoop.getInductionVar(),
-                                    icLoop.getInductionVar(),
-                                    khLoop.getInductionVar(),
-                                    kwLoop.getInductionVar(),
-                                    outputStore.getMemRef(), inputMemref,
-                                    weightMemref))
-    if (!matchStoreStyleReductionConvLinearized(
-            redOps, ocLoop.getInductionVar(), ohLoop.getInductionVar(),
-            owLoop.getInductionVar(), icLoop.getInductionVar(),
-            khLoop.getInductionVar(), kwLoop.getInductionVar(),
-            icLoop.getConstantUpperBound(),
-            ohLoop.getConstantUpperBound() + khLoop.getConstantUpperBound() - 1,
-            owLoop.getConstantUpperBound() + kwLoop.getConstantUpperBound() - 1,
-            ocLoop.getConstantUpperBound(), ohLoop.getConstantUpperBound(),
-            owLoop.getConstantUpperBound(), khLoop.getConstantUpperBound(),
-            kwLoop.getConstantUpperBound(), outputStore.getMemRef(),
-            inputMemref, weightMemref))
-    return failure();
+  }
 
   info.family = StringRef("CONV");
+  info.sourceFamily = info.family;
   info.inputMemref = inputMemref;
   info.weightMemref = weightMemref;
-  info.outputMemref = outputStore.getMemRef();
-  info.inputShape = {1, icLoop.getConstantUpperBound(),
-                     ohLoop.getConstantUpperBound() + khLoop.getConstantUpperBound() - 1,
-                     owLoop.getConstantUpperBound() + kwLoop.getConstantUpperBound() - 1};
-  info.weightShape = {ocLoop.getConstantUpperBound(), icLoop.getConstantUpperBound(),
-                      khLoop.getConstantUpperBound(), kwLoop.getConstantUpperBound()};
+  info.outputMemref = outputMemref;
+  auto inputType = cast<MemRefType>(inputMemref.getType());
+  auto weightType = cast<MemRefType>(weightMemref.getType());
+  info.inputShape = llvm::to_vector(inputType.getShape());
+  info.weightShape = llvm::to_vector(weightType.getShape());
   info.outputShape = {1, ocLoop.getConstantUpperBound(), ohLoop.getConstantUpperBound(),
                       owLoop.getConstantUpperBound()};
   auto context = func.getContext();
@@ -1294,6 +1729,13 @@ static SmallVector<int64_t, 4> getContiguousStrides(ArrayRef<int64_t> shape) {
   return strides;
 }
 
+static int64_t getNumElements(ArrayRef<int64_t> shape) {
+  int64_t total = 1;
+  for (int64_t dim : shape)
+    total *= dim;
+  return total;
+}
+
 static Value materializeStaticMemrefView(OpBuilder &builder, Location loc,
                                          Value source, ArrayRef<int64_t> shape) {
   auto sourceType = dyn_cast<MemRefType>(source.getType());
@@ -1302,7 +1744,22 @@ static Value materializeStaticMemrefView(OpBuilder &builder, Location loc,
   if (sourceType.hasStaticShape() && sourceType.getShape().size() == shape.size() &&
       llvm::equal(sourceType.getShape(), shape))
     return source;
-  if (sourceType.getRank() != 1)
+  if (sourceType.getRank() == 1) {
+    auto resultType = MemRefType::get(shape, sourceType.getElementType());
+    SmallVector<OpFoldResult, 4> sizes;
+    SmallVector<OpFoldResult, 4> strides;
+    auto contiguousStrides = getContiguousStrides(shape);
+    for (int64_t size : shape)
+      sizes.push_back(builder.getIndexAttr(size));
+    for (int64_t stride : contiguousStrides)
+      strides.push_back(builder.getIndexAttr(stride));
+    return builder.create<memref::ReinterpretCastOp>(loc, resultType, source,
+                                                     builder.getIndexAttr(0),
+                                                     sizes, strides);
+  }
+  if (!sourceType.hasStaticShape())
+    return source;
+  if (getNumElements(sourceType.getShape()) != getNumElements(shape))
     return source;
 
   auto resultType = MemRefType::get(shape, sourceType.getElementType());
@@ -1318,42 +1775,248 @@ static Value materializeStaticMemrefView(OpBuilder &builder, Location loc,
                                                    strides);
 }
 
-static FailureOr<AffineCandidateInfo> matchSingleAffineCandidate(func::FuncOp func) {
+static RankedTensorType getDesiredTensorType(Value memref,
+                                             ArrayRef<int64_t> shape) {
+  auto memrefType = dyn_cast<MemRefType>(memref.getType());
+  if (!memrefType)
+    return RankedTensorType();
+  if (!shape.empty())
+    return RankedTensorType::get(shape, memrefType.getElementType());
+  if (!memrefType.hasStaticShape())
+    return RankedTensorType();
+  return RankedTensorType::get(memrefType.getShape(), memrefType.getElementType());
+}
+
+static Value createIndexConstant(OpBuilder &builder, Location loc, int64_t value) {
+  return builder.create<arith::ConstantIndexOp>(loc, value);
+}
+
+static accel::GEMMOp lowerConvAsGemmOnly(OpBuilder &builder, Location loc,
+                                         Value inputMemref, Value weightMemref,
+                                         Value outputMemref,
+                                         bool hasExistingInput) {
+  auto inputType = cast<MemRefType>(inputMemref.getType());
+  auto weightType = cast<MemRefType>(weightMemref.getType());
+  auto outputType = cast<MemRefType>(outputMemref.getType());
+  const int64_t oc = outputType.getShape()[1];
+  const int64_t oh = outputType.getShape()[2];
+  const int64_t ow = outputType.getShape()[3];
+  const int64_t ic = inputType.getShape()[1];
+  const int64_t kh = weightType.getShape()[2];
+  const int64_t kw = weightType.getShape()[3];
+  const int64_t flatK = ic * kh * kw;
+  const int64_t flatN = oh * ow;
+
+  auto gemmAType = MemRefType::get({oc, flatK}, weightType.getElementType());
+  auto gemmBType = MemRefType::get({flatK, flatN}, inputType.getElementType());
+  auto gemmOutType = MemRefType::get({oc, flatN}, outputType.getElementType());
+
+  Value gemmA = builder.create<memref::AllocOp>(loc, gemmAType);
+  Value gemmB = builder.create<memref::AllocOp>(loc, gemmBType);
+  auto c0 = createIndexConstant(builder, loc, 0);
+  auto cKhKw = createIndexConstant(builder, loc, kh * kw);
+  auto cOw = createIndexConstant(builder, loc, ow);
+
+  auto ocLoop = builder.create<AffineForOp>(loc, 0, oc, 1);
+  builder.setInsertionPointToStart(ocLoop.getBody());
+  auto flatKLoop = builder.create<AffineForOp>(loc, 0, flatK, 1);
+  builder.setInsertionPointToStart(flatKLoop.getBody());
+  Value icIdx =
+      builder.create<arith::DivUIOp>(loc, flatKLoop.getInductionVar(), cKhKw);
+  Value rem0 =
+      builder.create<arith::RemUIOp>(loc, flatKLoop.getInductionVar(), cKhKw);
+  Value khIdx = builder.create<arith::DivUIOp>(
+      loc, rem0, createIndexConstant(builder, loc, kw));
+  Value kwIdx = builder.create<arith::RemUIOp>(
+      loc, rem0, createIndexConstant(builder, loc, kw));
+  Value aElt = builder.create<memref::LoadOp>(
+      loc, weightMemref,
+      ValueRange{ocLoop.getInductionVar(), icIdx, khIdx, kwIdx});
+  builder.create<memref::StoreOp>(
+      loc, aElt, gemmA,
+      ValueRange{ocLoop.getInductionVar(), flatKLoop.getInductionVar()});
+  builder.setInsertionPointAfter(flatKLoop);
+  builder.setInsertionPointAfter(ocLoop);
+
+  auto flatKLoopB = builder.create<AffineForOp>(loc, 0, flatK, 1);
+  builder.setInsertionPointToStart(flatKLoopB.getBody());
+  auto flatNLoopB = builder.create<AffineForOp>(loc, 0, flatN, 1);
+  builder.setInsertionPointToStart(flatNLoopB.getBody());
+  Value icIdxB =
+      builder.create<arith::DivUIOp>(loc, flatKLoopB.getInductionVar(), cKhKw);
+  Value remB =
+      builder.create<arith::RemUIOp>(loc, flatKLoopB.getInductionVar(), cKhKw);
+  Value khIdxB = builder.create<arith::DivUIOp>(
+      loc, remB, createIndexConstant(builder, loc, kw));
+  Value kwIdxB = builder.create<arith::RemUIOp>(
+      loc, remB, createIndexConstant(builder, loc, kw));
+  Value ohIdx = builder.create<arith::DivUIOp>(loc, flatNLoopB.getInductionVar(), cOw);
+  Value owIdx = builder.create<arith::RemUIOp>(loc, flatNLoopB.getInductionVar(), cOw);
+  Value ihIdx = builder.create<arith::AddIOp>(loc, ohIdx, khIdxB);
+  Value iwIdx = builder.create<arith::AddIOp>(loc, owIdx, kwIdxB);
+  Value bElt = builder.create<memref::LoadOp>(
+      loc, inputMemref, ValueRange{c0, icIdxB, ihIdx, iwIdx});
+  builder.create<memref::StoreOp>(
+      loc, bElt, gemmB,
+      ValueRange{flatKLoopB.getInductionVar(), flatNLoopB.getInductionVar()});
+  builder.setInsertionPointAfter(flatNLoopB);
+  builder.setInsertionPointAfter(flatKLoopB);
+
+  auto gemmATensor = builder.create<bufferization::ToTensorOp>(
+      loc, RankedTensorType::get({oc, flatK}, weightType.getElementType()), gemmA);
+  auto gemmBTensor = builder.create<bufferization::ToTensorOp>(
+      loc, RankedTensorType::get({flatK, flatN}, inputType.getElementType()), gemmB);
+  Value existingTensor;
+  if (hasExistingInput) {
+    auto existingType = MemRefType::get({oc, flatN}, outputType.getElementType());
+    Value existing = builder.create<memref::AllocOp>(loc, existingType);
+    auto ocLoopE = builder.create<AffineForOp>(loc, 0, oc, 1);
+    builder.setInsertionPointToStart(ocLoopE.getBody());
+    auto flatNLoopE = builder.create<AffineForOp>(loc, 0, flatN, 1);
+    builder.setInsertionPointToStart(flatNLoopE.getBody());
+    Value ohIdxE =
+        builder.create<arith::DivUIOp>(loc, flatNLoopE.getInductionVar(), cOw);
+    Value owIdxE =
+        builder.create<arith::RemUIOp>(loc, flatNLoopE.getInductionVar(), cOw);
+    Value eElt = builder.create<memref::LoadOp>(
+        loc, outputMemref,
+        ValueRange{c0, ocLoopE.getInductionVar(), ohIdxE, owIdxE});
+    builder.create<memref::StoreOp>(
+        loc, eElt, existing,
+        ValueRange{ocLoopE.getInductionVar(), flatNLoopE.getInductionVar()});
+    builder.setInsertionPointAfter(flatNLoopE);
+    builder.setInsertionPointAfter(ocLoopE);
+    existingTensor = builder.create<bufferization::ToTensorOp>(
+        loc, RankedTensorType::get({oc, flatN}, outputType.getElementType()),
+        existing);
+  }
+  auto gemm = builder.create<accel::GEMMOp>(
+      loc, RankedTensorType::get({oc, flatN}, outputType.getElementType()),
+      gemmATensor, gemmBTensor, Value(), existingTensor);
+
+  auto gemmResultMemref = builder.create<bufferization::ToMemrefOp>(
+      loc, gemmOutType, gemm.getResult());
+  auto ocLoopR = builder.create<AffineForOp>(loc, 0, oc, 1);
+  builder.setInsertionPointToStart(ocLoopR.getBody());
+  auto ohLoopR = builder.create<AffineForOp>(loc, 0, oh, 1);
+  builder.setInsertionPointToStart(ohLoopR.getBody());
+  auto owLoopR = builder.create<AffineForOp>(loc, 0, ow, 1);
+  builder.setInsertionPointToStart(owLoopR.getBody());
+  Value flatNIdxR = builder.create<arith::AddIOp>(
+      loc,
+      builder.create<arith::MulIOp>(loc, ohLoopR.getInductionVar(), cOw),
+      owLoopR.getInductionVar());
+  Value outElt = builder.create<memref::LoadOp>(
+      loc, gemmResultMemref,
+      ValueRange{ocLoopR.getInductionVar(), flatNIdxR});
+  builder.create<memref::StoreOp>(
+      loc, outElt, outputMemref,
+      ValueRange{c0, ocLoopR.getInductionVar(), ohLoopR.getInductionVar(),
+                 owLoopR.getInductionVar()});
+  builder.setInsertionPointAfter(owLoopR);
+  builder.setInsertionPointAfter(ohLoopR);
+  builder.setInsertionPointAfter(ocLoopR);
+  return gemm;
+}
+
+static void convertGEMMVToGEMMOnly(AffineCandidateInfo &info) {
+  info.family = StringRef("GEMM");
+}
+
+static void convertCONVToGEMMOnly(AffineCandidateInfo &info) {
+  auto inputShape = info.inputShape;
+  auto weightShape = info.weightShape;
+  auto outputShape = info.outputShape;
+  const int64_t oc = outputShape[1];
+  const int64_t oh = outputShape[2];
+  const int64_t ow = outputShape[3];
+  const int64_t ic = inputShape[1];
+  const int64_t kh = weightShape[2];
+  const int64_t kw = weightShape[3];
+  info.family = StringRef("GEMM");
+  info.inputShape = {1, oc, ic * kh * kw};
+  info.weightShape = {1, ic * kh * kw, oh * ow};
+  info.outputShape = {1, oc, oh * ow};
+}
+
+static FailureOr<AffineCandidateInfo> matchSingleAffineCandidate(func::FuncOp func,
+                                                                 bool gemmOnly) {
   AffineCandidateInfo info;
-  if (succeeded(matchCanonicalCONV(func, info)))
-    return info;
-  if (succeeded(matchStripMinedCONV(func, info)))
-    return info;
   if (succeeded(matchCanonicalGEMM(func, info)))
     return info;
   if (succeeded(matchStripMinedGEMM(func, info)))
     return info;
-  if (succeeded(matchCanonicalGEMMV(func, info)))
-    return info;
-  if (succeeded(matchStripMinedGEMMV(func, info)))
-    return info;
+  if (!gemmOnly) {
+    if (succeeded(matchCanonicalCONV(func, info)))
+      return info;
+    if (succeeded(matchStripMinedCONV(func, info)))
+      return info;
+  } else {
+    if (succeeded(matchCanonicalCONV(func, info))) {
+      convertCONVToGEMMOnly(info);
+      return info;
+    }
+    if (succeeded(matchStripMinedCONV(func, info))) {
+      convertCONVToGEMMOnly(info);
+      return info;
+    }
+  }
+  if (!gemmOnly) {
+    if (succeeded(matchCanonicalGEMMV(func, info)))
+      return info;
+    if (succeeded(matchStripMinedGEMMV(func, info)))
+      return info;
+  } else {
+    if (succeeded(matchCanonicalGEMMV(func, info))) {
+      convertGEMMVToGEMMOnly(info);
+      return info;
+    }
+    if (succeeded(matchStripMinedGEMMV(func, info))) {
+      convertGEMMVToGEMMOnly(info);
+      return info;
+    }
+  }
   return failure();
 }
 
 struct LowerAffineToAccel : public LowerAffineToAccelBase<LowerAffineToAccel> {
+  LowerAffineToAccel() = default;
+  explicit LowerAffineToAccel(bool gemmOnlyValue) { gemmOnly = gemmOnlyValue; }
+
   void runOnOperation() override {
     auto func = getOperation();
-    auto candidate = matchSingleAffineCandidate(func);
+    auto candidate = matchSingleAffineCandidate(func, gemmOnly);
     if (failed(candidate))
       return;
 
-    auto inputType = getTensorType(candidate->inputMemref, candidate->inputShape);
-    auto weightType = getTensorType(candidate->weightMemref, candidate->weightShape);
-    auto outputType = getTensorType(candidate->outputMemref, candidate->outputShape);
+    auto inputType = getDesiredTensorType(candidate->inputMemref, candidate->inputShape);
+    auto weightType = getDesiredTensorType(candidate->weightMemref, candidate->weightShape);
+    auto outputType = getDesiredTensorType(candidate->outputMemref, candidate->outputShape);
     if (!inputType || !weightType || !outputType)
       return;
 
     auto returnOp = cast<func::ReturnOp>(func.front().getTerminator());
     SmallVector<Operation *, 8> oldOps;
-    for (Operation &op : func.front().without_terminator())
+    for (Operation &op : func.front().without_terminator()) {
+      if (isa<arith::ConstantOp>(op))
+        continue;
       oldOps.push_back(&op);
+    }
 
     OpBuilder builder(returnOp);
+    if (candidate->family == "GEMM" &&
+        candidate->sourceFamily == StringRef("CONV")) {
+      auto gemm = lowerConvAsGemmOnly(builder, func.getLoc(),
+                                      candidate->inputMemref,
+                                      candidate->weightMemref,
+                                      candidate->outputMemref,
+                                      candidate->hasExistingInput);
+      annotateCandidateAttrs(gemm.getOperation(), func, *candidate);
+      for (Operation *op : llvm::reverse(oldOps))
+        op->erase();
+      return;
+    }
+
     Value shapedInput = materializeStaticMemrefView(builder, func.getLoc(),
                                                     candidate->inputMemref,
                                                     candidate->inputShape);
@@ -1363,12 +2026,14 @@ struct LowerAffineToAccel : public LowerAffineToAccelBase<LowerAffineToAccel> {
     Value shapedOutput = materializeStaticMemrefView(builder, func.getLoc(),
                                                      candidate->outputMemref,
                                                      candidate->outputShape);
-    auto input = builder.create<bufferization::ToTensorOp>(
-        func.getLoc(), inputType, shapedInput);
-    auto weight = builder.create<bufferization::ToTensorOp>(
-        func.getLoc(), weightType, shapedWeight);
-    auto existing = builder.create<bufferization::ToTensorOp>(
-        func.getLoc(), outputType, shapedOutput);
+    auto input =
+        builder.create<bufferization::ToTensorOp>(func.getLoc(), inputType, shapedInput);
+    auto weight =
+        builder.create<bufferization::ToTensorOp>(func.getLoc(), weightType, shapedWeight);
+    Value existing;
+    if (candidate->hasExistingInput)
+      existing = builder.create<bufferization::ToTensorOp>(func.getLoc(), outputType,
+                                                           shapedOutput);
 
     Value lowered;
     if (candidate->family == "GEMMV") {
@@ -1395,12 +2060,12 @@ struct LowerAffineToAccel : public LowerAffineToAccelBase<LowerAffineToAccel> {
         func.getLoc(), shapedOutput.getType(), lowered);
     builder.create<memref::CopyOp>(func.getLoc(), resultMemref, shapedOutput);
 
-    for (Operation *op : oldOps)
+    for (Operation *op : llvm::reverse(oldOps))
       op->erase();
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> scalehls::createLowerAffineToAccelPass() {
-  return std::make_unique<LowerAffineToAccel>();
+std::unique_ptr<Pass> scalehls::createLowerAffineToAccelPass(bool gemmOnly) {
+  return std::make_unique<LowerAffineToAccel>(gemmOnly);
 }

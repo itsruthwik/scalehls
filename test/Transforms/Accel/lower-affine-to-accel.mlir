@@ -8,6 +8,8 @@
 // RUN: scalehls-opt -split-input-file -c-accel-pipeline="top-func=conv2d_valid_i8" %s | FileCheck %s --check-prefix=CONV-I8-CALL
 // RUN: scalehls-opt -split-input-file -lower-affine-to-accel %s | FileCheck %s --check-prefix=GEMMV-PTR
 // RUN: scalehls-opt -split-input-file -c-accel-pipeline="top-func=gemmv_fp32_ptr" %s | FileCheck %s --check-prefix=GEMMV-PTR-CALL
+// RUN: scalehls-opt -split-input-file -lower-affine-to-accel %s | FileCheck %s --check-prefix=ITER-GEMMV
+// RUN: scalehls-opt -split-input-file -lower-affine-to-accel="gemm-only=true" %s | FileCheck %s --check-prefix=GEMM-ONLY-CONV
 
 // GEMMV-LABEL: func.func @gemmv_strict_f32(
 // GEMMV: %[[A:.*]] = bufferization.to_tensor %arg1 : memref<8x16xf32>
@@ -42,7 +44,7 @@ func.func @gemmv_strict_f32(%C: memref<8x8xf32>, %A: memref<8x16xf32>, %B: memre
 // GEMMV-CALL-LABEL: func.func @gemmv_strict_f32(
 // GEMMV-CALL: %[[TMP:.*]] = memref.alloc() : memref<8x8xf32>
 // GEMMV-CALL: call @gemmv_strict_f32_accel_gemmv_f32_in8x16_w16x8_ei8x8_out8x8(%arg1, %arg2, %arg0, %[[TMP]])
-// GEMMV-CALL: memref.copy %[[TMP]], %arg0 : memref<8x8xf32> to memref<8x8xf32>
+// GEMMV-CALL: affine.load %[[TMP]]
 // GEMMV-CALL: return
 
 // -----
@@ -82,7 +84,7 @@ func.func @batched_gemm_strict_f32(%C: memref<2x4x5xf32>, %A: memref<2x4x6xf32>,
 // GEMM-CALL-LABEL: func.func @batched_gemm_strict_f32(
 // GEMM-CALL: %[[TMP:.*]] = memref.alloc() : memref<2x4x5xf32>
 // GEMM-CALL: call @batched_gemm_strict_f32_accel_gemm_f32_in2x4x6_w2x6x5_ei2x4x5_out2x4x5(%arg1, %arg2, %arg0, %[[TMP]])
-// GEMM-CALL: memref.copy %[[TMP]], %arg0 : memref<2x4x5xf32> to memref<2x4x5xf32>
+// GEMM-CALL: affine.load %[[TMP]]
 // GEMM-CALL: return
 
 // -----
@@ -128,7 +130,7 @@ func.func @conv2d_valid_f32(%O: memref<1x3x3x3xf32>, %I: memref<1x2x5x5xf32>, %W
 // CONV-CALL-LABEL: func.func @conv2d_valid_f32(
 // CONV-CALL: %[[TMP:.*]] = memref.alloc() : memref<1x3x3x3xf32>
 // CONV-CALL: call @conv2d_valid_f32_accel_conv_f32_in1x2x5x5_w3x2x3x3_ei1x3x3x3_out1x3x3x3(%arg1, %arg2, %arg0, %[[TMP]])
-// CONV-CALL: memref.copy %[[TMP]], %arg0 : memref<1x3x3x3xf32> to memref<1x3x3x3xf32>
+// CONV-CALL: affine.load %[[TMP]]
 // CONV-CALL: return
 
 // -----
@@ -162,7 +164,7 @@ func.func @test_not_family(%A: memref<8x8xf32>, %B: memref<8x8xf32>) {
 // GEMMV-I8-CALL-LABEL: func.func @gemmv_strict_i8(
 // GEMMV-I8-CALL: %[[TMP:.*]] = memref.alloc() : memref<8x8xi8>
 // GEMMV-I8-CALL: call @gemmv_strict_i8_accel_gemmv_i_in8x16_w16x8_ei8x8_out8x8(%arg1, %arg2, %arg0, %[[TMP]])
-// GEMMV-I8-CALL: memref.copy %[[TMP]], %arg0 : memref<8x8xi8> to memref<8x8xi8>
+// GEMMV-I8-CALL: affine.load %[[TMP]]
 func.func @gemmv_strict_i8(%C: memref<8x8xi8>, %A: memref<8x16xi8>, %B: memref<16x8xi8>) {
   affine.for %i = 0 to 8 {
     affine.for %j = 0 to 8 {
@@ -197,7 +199,7 @@ func.func @gemmv_strict_i8(%C: memref<8x8xi8>, %A: memref<8x16xi8>, %B: memref<1
 // CONV-I8-CALL-LABEL: func.func @conv2d_valid_i8(
 // CONV-I8-CALL: %[[TMP:.*]] = memref.alloc() : memref<1x3x3x3xi8>
 // CONV-I8-CALL: call @conv2d_valid_i8_accel_conv_i_in1x2x5x5_w3x2x3x3_ei1x3x3x3_out1x3x3x3(%arg1, %arg2, %arg0, %[[TMP]])
-// CONV-I8-CALL: memref.copy %[[TMP]], %arg0 : memref<1x3x3x3xi8> to memref<1x3x3x3xi8>
+// CONV-I8-CALL: affine.load %[[TMP]]
 func.func @conv2d_valid_i8(%O: memref<1x3x3x3xi8>, %I: memref<1x2x5x5xi8>, %W: memref<3x2x3x3xi8>) {
   affine.for %oc = 0 to 3 {
     affine.for %oh = 0 to 3 {
@@ -247,6 +249,73 @@ func.func @gemmv_fp32_ptr(%C: memref<?xf32>, %A: memref<?xf32>, %B: memref<?xf32
         %c = affine.load %C[%j + %i * 8] : memref<?xf32>
         %sum = arith.addf %c, %prod : f32
         affine.store %sum, %C[%j + %i * 8] : memref<?xf32>
+      }
+    }
+  }
+  return
+}
+
+// -----
+
+// ITER-GEMMV-LABEL: func.func @gemmv_iter_args_i8(
+// ITER-GEMMV: %[[A:.*]] = bufferization.to_tensor %arg1 : memref<8x16xi8>
+// ITER-GEMMV: %[[B:.*]] = bufferization.to_tensor %arg2 : memref<16x8xi8>
+// ITER-GEMMV: %[[C:.*]] = bufferization.to_tensor %arg0 : memref<8x8xi8>
+// ITER-GEMMV: %[[R:.*]] = "accel.gemmv"(%[[A]], %[[B]], %[[C]])
+// ITER-GEMMV-SAME: scalehls.accelerator_family = "GEMMV"
+func.func @gemmv_iter_args_i8(%C: memref<8x8xi8>, %A: memref<8x16xi8>, %B: memref<16x8xi8>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %c0 = affine.load %C[%i, %j] : memref<8x8xi8>
+      %acc = affine.for %k = 0 to 16 iter_args(%sum_iter = %c0) -> (i8) {
+        %a = affine.load %A[%i, %k] : memref<8x16xi8>
+        %a32 = arith.extsi %a : i8 to i32
+        %b = affine.load %B[%k, %j] : memref<16x8xi8>
+        %b32 = arith.extsi %b : i8 to i32
+        %prod = arith.muli %a32, %b32 : i32
+        %sum32 = arith.extsi %sum_iter : i8 to i32
+        %next32 = arith.addi %sum32, %prod : i32
+        %next = arith.trunci %next32 : i32 to i8
+        affine.yield %next : i8
+      }
+      affine.store %acc, %C[%i, %j] : memref<8x8xi8>
+    }
+  }
+  return
+}
+
+// -----
+
+// GEMM-ONLY-CONV-LABEL: func.func @conv2d_iter_args_i8(
+// GEMM-ONLY-CONV: %[[A:.*]] = bufferization.to_tensor %{{.*}} : memref<1x3x18xi8>
+// GEMM-ONLY-CONV: %[[B:.*]] = bufferization.to_tensor %{{.*}} : memref<1x18x9xi8>
+// GEMM-ONLY-CONV: %[[C:.*]] = bufferization.to_tensor %{{.*}} : memref<1x3x9xi8>
+// GEMM-ONLY-CONV: %[[R:.*]] = "accel.gemm"(%[[A]], %[[B]], %[[C]])
+// GEMM-ONLY-CONV-SAME: scalehls.accelerator_family = "GEMM"
+// GEMM-ONLY-CONV-NOT: "accel.conv"
+func.func @conv2d_iter_args_i8(%O: memref<1x3x3x3xi8>, %I: memref<1x2x5x5xi8>, %W: memref<3x2x3x3xi8>) {
+  affine.for %oc = 0 to 3 {
+    affine.for %oh = 0 to 3 {
+      affine.for %ow = 0 to 3 {
+        %out0 = affine.load %O[0, %oc, %oh, %ow] : memref<1x3x3x3xi8>
+        %sum_ic = affine.for %ic = 0 to 2 iter_args(%acc_ic = %out0) -> (i8) {
+          %sum_kh = affine.for %kh = 0 to 3 iter_args(%acc_kh = %acc_ic) -> (i8) {
+            %sum_kw = affine.for %kw = 0 to 3 iter_args(%acc_kw = %acc_kh) -> (i8) {
+              %in = affine.load %I[0, %ic, %oh + %kh, %ow + %kw] : memref<1x2x5x5xi8>
+              %in32 = arith.extsi %in : i8 to i32
+              %w = affine.load %W[%oc, %ic, %kh, %kw] : memref<3x2x3x3xi8>
+              %w32 = arith.extsi %w : i8 to i32
+              %prod = arith.muli %in32, %w32 : i32
+              %acc32 = arith.extsi %acc_kw : i8 to i32
+              %next32 = arith.addi %acc32, %prod : i32
+              %next = arith.trunci %next32 : i32 to i8
+              affine.yield %next : i8
+            }
+            affine.yield %sum_kw : i8
+          }
+          affine.yield %sum_kh : i8
+        }
+        affine.store %sum_ic, %O[0, %oc, %oh, %ow] : memref<1x3x3x3xi8>
       }
     }
   }
