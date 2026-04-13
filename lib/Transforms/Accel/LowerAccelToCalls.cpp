@@ -6,8 +6,11 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "scalehls/Dialect/Accel/Accel.h"
 #include "scalehls/Transforms/Passes.h"
@@ -41,6 +44,12 @@ constexpr StringLiteral kPointerTransportAttr =
 constexpr StringLiteral kUntiledPointerTransport = "untiled";
 constexpr StringLiteral kTiledPointerTransport = "tiled_persistent";
 constexpr StringLiteral kABIModeAttr = "scalehls.accelerator_abi_mode";
+constexpr StringLiteral kIPTileSizeAttr = "scalehls.accelerator_ip_tile_size";
+constexpr StringLiteral kIPTilingModeAttr = "scalehls.accelerator_ip_tiling_mode";
+constexpr StringLiteral kIPTileRowAttr = "scalehls.accelerator_ip_tile_row";
+constexpr StringLiteral kIPTileColAttr = "scalehls.accelerator_ip_tile_col";
+constexpr StringLiteral kIPTileKAttr = "scalehls.accelerator_ip_tile_k";
+constexpr StringLiteral kSerialIPTilingMode = "serial";
 } // namespace
 
 namespace {
@@ -75,6 +84,13 @@ static SmallVector<int64_t> getStaticShape(Value value) {
   if (!shapedType || !shapedType.hasStaticShape())
     return shape;
   shape.append(shapedType.getShape().begin(), shapedType.getShape().end());
+  return shape;
+}
+
+static SmallVector<int64_t> getHelperShape(Operation *op, Value value) {
+  auto shape = getStaticShape(value);
+  if (isa<accel::GEMMOp>(op) && shape.size() == 3)
+    return SmallVector<int64_t>(llvm::drop_begin(shape));
   return shape;
 }
 
@@ -122,11 +138,11 @@ static Value getExistingInputOperand(Operation *op) {
 static std::string buildAcceleratorName(func::FuncOp func, Operation *op) {
   StringRef family = getFamilyName(op);
   auto result = op->getResult(0);
-  auto inputShape = getStaticShape(op->getOperand(0));
-  auto weightShape = getStaticShape(op->getOperand(1));
-  auto outputShape = getStaticShape(result);
-  auto biasShape = getStaticShape(getBiasOperand(op));
-  auto existingShape = getStaticShape(getExistingInputOperand(op));
+  auto inputShape = getHelperShape(op, op->getOperand(0));
+  auto weightShape = getHelperShape(op, op->getOperand(1));
+  auto outputShape = getHelperShape(op, result);
+  auto biasShape = getHelperShape(op, getBiasOperand(op));
+  auto existingShape = getHelperShape(op, getExistingInputOperand(op));
 
   std::string name = func.getName().str() + "_accel_";
   name += family.lower();
@@ -145,6 +161,21 @@ static std::string buildAcceleratorName(func::FuncOp func, Operation *op) {
   return name;
 }
 
+static std::string buildTiledAcceleratorName(func::FuncOp func, Operation *op) {
+  std::string name = buildAcceleratorName(func, op);
+  if (auto tileSize = op->getAttrOfType<StringAttr>(kIPTileSizeAttr))
+    name += "_ip" + tileSize.getValue().str();
+  auto tileRow = op->getAttrOfType<IntegerAttr>(kIPTileRowAttr);
+  auto tileCol = op->getAttrOfType<IntegerAttr>(kIPTileColAttr);
+  auto tileK = op->getAttrOfType<IntegerAttr>(kIPTileKAttr);
+  if (tileRow && tileCol) {
+    name += llvm::formatv("_tile{0}_{1}", tileRow.getInt(), tileCol.getInt()).str();
+    if (tileK)
+      name += llvm::formatv("_k{0}", tileK.getInt()).str();
+  }
+  return name;
+}
+
 static std::string uniquifySymbolName(SymbolTable &symbolTable,
                                       StringRef baseName) {
   std::string uniqueName = baseName.str();
@@ -157,10 +188,11 @@ static std::string uniquifySymbolName(SymbolTable &symbolTable,
 static void copyMappingAttrs(Operation *from, Operation *to, Operation *accelOp) {
   for (StringRef attrName :
        {kDetectedAttr, kContractAttr, kFamilyAttr, kShapeAttr, kAShapeAttr,
-        kBShapeAttr, kCShapeAttr, kBiasShapeAttr, kAArgAttr, kBArgAttr,
+       kBShapeAttr, kCShapeAttr, kBiasShapeAttr, kAArgAttr, kBArgAttr,
         kCArgAttr, kBiasArgAttr, kPrecisionAttr, kElementBitsAttr,
         kElementBytesAttr, kHasBiasAttr, kPointerTransportAttr,
-        kABIModeAttr}) {
+        kABIModeAttr, kIPTileSizeAttr, kIPTilingModeAttr, kIPTileRowAttr,
+        kIPTileColAttr, kIPTileKAttr}) {
     if (auto attr = from->getAttr(attrName))
       to->setAttr(attrName, attr);
   }
@@ -181,68 +213,146 @@ static void copyMappingAttrs(Operation *from, Operation *to, Operation *accelOp)
     to->setAttr(kCandidateIndexAttr, candidateIndex);
 }
 
-static void enumerateFlatIndexTuples(OpBuilder &builder, Location loc,
-                                     ArrayRef<int64_t> shape,
-                                     SmallVectorImpl<SmallVector<Value>> &all) {
-  all.clear();
-  if (shape.empty()) {
-    all.push_back({});
-    return;
-  }
-
-  SmallVector<int64_t> current(shape.size(), 0);
-  while (true) {
-    SmallVector<Value> tuple;
-    tuple.reserve(shape.size());
-    for (int64_t index : current)
-      tuple.push_back(builder.create<arith::ConstantIndexOp>(loc, index));
-    all.push_back(std::move(tuple));
-
-    int64_t dim = static_cast<int64_t>(shape.size()) - 1;
-    while (dim >= 0) {
-      ++current[dim];
-      if (current[dim] < shape[dim])
-        break;
-      current[dim] = 0;
-      --dim;
-    }
-    if (dim < 0)
-      break;
-  }
+static RankedTensorType getHelperTensorType(Operation *op, Value value) {
+  auto shapedType = dyn_cast<RankedTensorType>(value.getType());
+  if (!shapedType || !shapedType.hasStaticShape())
+    return RankedTensorType();
+  auto shape = getHelperShape(op, value);
+  return RankedTensorType::get(shape, shapedType.getElementType());
 }
 
-static LogicalResult flattenTensorOperand(OpBuilder &builder, Location loc,
-                                          Value tensor,
-                                          SmallVectorImpl<Value> &flatValues) {
-  auto tensorType = dyn_cast<RankedTensorType>(tensor.getType());
-  if (!tensorType || !tensorType.hasStaticShape())
-    return failure();
-
-  SmallVector<SmallVector<Value>> allIndices;
-  enumerateFlatIndexTuples(builder, loc, tensorType.getShape(), allIndices);
-  for (ArrayRef<Value> indices : allIndices)
-    flatValues.push_back(builder.create<tensor::ExtractOp>(loc, tensor, indices));
-  return success();
+static Value collapseLeadingBatchSlice(OpBuilder &builder, Location loc, Value slice) {
+  auto sliceType = dyn_cast<RankedTensorType>(slice.getType());
+  if (!sliceType || sliceType.getRank() != 3 || sliceType.getShape().front() != 1)
+    return slice;
+  auto collapsedType = RankedTensorType::get(
+      {sliceType.getShape()[1], sliceType.getShape()[2]}, sliceType.getElementType());
+  SmallVector<ReassociationIndices, 2> reassociation = {{0, 1}, {2}};
+  return builder.create<tensor::CollapseShapeOp>(loc, collapsedType, slice,
+                                                 reassociation);
 }
 
-static LogicalResult rebuildTensorResultFromFlatValues(
-    OpBuilder &builder, Location loc, RankedTensorType tensorType,
-    ValueRange flatValues, Value &rebuiltTensor) {
-  if (!tensorType.hasStaticShape())
-    return failure();
-  auto elementCount = tensorType.getNumElements();
-  if (flatValues.size() != static_cast<size_t>(elementCount))
-    return failure();
-  rebuiltTensor = builder.create<tensor::FromElementsOp>(loc, tensorType,
-                                                         flatValues);
-  return success();
+static Value expandLeadingBatchSlice(OpBuilder &builder, Location loc, Value slice,
+                                     RankedTensorType targetType) {
+  SmallVector<ReassociationIndices, 2> reassociation = {{0, 1}, {2}};
+  return builder.create<tensor::ExpandShapeOp>(loc, targetType, slice, reassociation);
 }
 
 struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
   LowerAccelToCalls() = default;
-  LowerAccelToCalls(std::string abiModeValue, unsigned maxElementsValue) {
-    abiMode = std::move(abiModeValue);
+  LowerAccelToCalls(std::string, unsigned maxElementsValue) {
     maxElements = maxElementsValue;
+  }
+
+  LogicalResult lowerBatchedGemmTo2DHelper(OpBuilder &builder,
+                                           SymbolTable &symbolTable,
+                                           func::FuncOp func,
+                                           accel::GEMMOp gemmOp,
+                                           func::FuncOp &symbol) {
+    auto inputType = dyn_cast<RankedTensorType>(gemmOp.getInput().getType());
+    auto weightType = dyn_cast<RankedTensorType>(gemmOp.getWeight().getType());
+    auto outputType = dyn_cast<RankedTensorType>(gemmOp.getResult().getType());
+    if (!inputType || !weightType || !outputType || inputType.getRank() != 3 ||
+        weightType.getRank() != 3 || outputType.getRank() != 3 ||
+        !inputType.hasStaticShape() || !weightType.hasStaticShape() ||
+        !outputType.hasStaticShape())
+      return failure();
+
+    auto helperInputType = getHelperTensorType(gemmOp, gemmOp.getInput());
+    auto helperWeightType = getHelperTensorType(gemmOp, gemmOp.getWeight());
+    auto helperOutputType = getHelperTensorType(gemmOp, gemmOp.getResult());
+    RankedTensorType helperBiasType;
+    RankedTensorType helperExistingType;
+    if (gemmOp.getBias())
+      helperBiasType = getHelperTensorType(gemmOp, gemmOp.getBias());
+    if (gemmOp.getExistingInput())
+      helperExistingType = getHelperTensorType(gemmOp, gemmOp.getExistingInput());
+    if (!helperInputType || !helperWeightType || !helperOutputType)
+      return failure();
+
+    SmallVector<Type> operandTypes = {helperInputType, helperWeightType};
+    if (helperBiasType)
+      operandTypes.push_back(helperBiasType);
+    if (helperExistingType)
+      operandTypes.push_back(helperExistingType);
+
+    auto baseSymbolName = buildAcceleratorName(func, gemmOp);
+    auto symbolName = uniquifySymbolName(symbolTable, baseSymbolName);
+    builder.setInsertionPoint(func);
+    symbol = builder.create<func::FuncOp>(
+        func.getLoc(), symbolName,
+        builder.getFunctionType(operandTypes, TypeRange{helperOutputType}));
+    symbol->setAttr("sym_visibility",
+                    StringAttr::get(func.getContext(), "private"));
+    copyMappingAttrs(gemmOp, symbol, gemmOp);
+    symbolTable.insert(symbol);
+
+    builder.setInsertionPoint(gemmOp);
+    auto loc = gemmOp.getLoc();
+    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+    auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
+    auto batch = builder.create<arith::ConstantIndexOp>(loc, outputType.getShape()[0]);
+
+    Value init = gemmOp.getExistingInput();
+    if (!init)
+      init = builder.create<tensor::EmptyOp>(loc, outputType.getShape(),
+                                             outputType.getElementType());
+
+    auto loop = builder.create<scf::ForOp>(loc, zero, batch, one, ValueRange{init});
+    builder.setInsertionPointToStart(loop.getBody());
+    Value iv = loop.getInductionVar();
+    Value current = loop.getRegionIterArgs().front();
+
+    auto extract2D = [&](Value tensorValue, RankedTensorType rank2Type) -> Value {
+      if (!tensorValue)
+        return Value();
+      auto rank3Type = dyn_cast<RankedTensorType>(tensorValue.getType());
+      if (rank3Type && rank3Type.getRank() == 3) {
+        SmallVector<OpFoldResult> offsets = {
+            OpFoldResult(iv), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes = {
+            builder.getIndexAttr(1), builder.getIndexAttr(rank3Type.getShape()[1]),
+            builder.getIndexAttr(rank3Type.getShape()[2])};
+        SmallVector<OpFoldResult> strides = {
+            builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+        auto sliceType = RankedTensorType::get(
+            {1, rank3Type.getShape()[1], rank3Type.getShape()[2]},
+            rank3Type.getElementType());
+        Value slice = builder.create<tensor::ExtractSliceOp>(
+            loc, sliceType, tensorValue, offsets, sizes, strides);
+        return collapseLeadingBatchSlice(builder, loc, slice);
+      }
+      return tensorValue;
+    };
+
+    SmallVector<Value> callOperands;
+    callOperands.push_back(extract2D(gemmOp.getInput(), helperInputType));
+    callOperands.push_back(extract2D(gemmOp.getWeight(), helperWeightType));
+    if (gemmOp.getBias())
+      callOperands.push_back(extract2D(gemmOp.getBias(), helperBiasType));
+    if (gemmOp.getExistingInput())
+      callOperands.push_back(extract2D(current, helperExistingType));
+    auto call = builder.create<func::CallOp>(loc, TypeRange{helperOutputType},
+                                             symbol.getName(), callOperands);
+    auto expanded = expandLeadingBatchSlice(
+        builder, loc, call.getResult(0),
+        RankedTensorType::get({1, helperOutputType.getShape()[0],
+                               helperOutputType.getShape()[1]},
+                              helperOutputType.getElementType()));
+    SmallVector<OpFoldResult> offsets = {
+        OpFoldResult(iv), builder.getIndexAttr(0), builder.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {
+        builder.getIndexAttr(1), builder.getIndexAttr(helperOutputType.getShape()[0]),
+        builder.getIndexAttr(helperOutputType.getShape()[1])};
+    SmallVector<OpFoldResult> strides = {
+        builder.getIndexAttr(1), builder.getIndexAttr(1), builder.getIndexAttr(1)};
+    auto inserted = builder.create<tensor::InsertSliceOp>(loc, expanded, current,
+                                                          offsets, sizes, strides);
+    builder.create<scf::YieldOp>(loc, inserted.getResult());
+
+    gemmOp.getResult().replaceAllUsesWith(loop.getResult(0));
+    gemmOp.erase();
+    return success();
   }
 
   void runOnOperation() override {
@@ -260,28 +370,11 @@ struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
         continue;
 
       SmallVector<Attribute> outlinedSymbols;
+      llvm::StringMap<func::FuncOp> serialTileHelpers;
       for (Operation *accelOp : accelOps) {
-        StringRef selectedABIMode = abiMode;
+        StringRef selectedABIMode = "pointer";
         accelOp->setAttr(kABIModeAttr,
                          StringAttr::get(module.getContext(), selectedABIMode));
-        if (selectedABIMode != "pointer" && selectedABIMode != "full-data") {
-          accelOp->emitError()
-              << "ABI mode '" << selectedABIMode
-              << "' is not implemented yet; supported modes are pointer and full-data";
-          signalPassFailure();
-          return;
-        }
-
-        if (selectedABIMode == "full-data") {
-          SymbolRefAttr outlinedSymbol;
-          if (failed(lowerToFullDataABI(builder, symbolTable, func, accelOp,
-                                        outlinedSymbol))) {
-            signalPassFailure();
-            return;
-          }
-          outlinedSymbols.push_back(outlinedSymbol);
-          continue;
-        }
 
         auto outputElements = getStaticElementCount(accelOp->getResult(0));
         const bool useTiledPointer =
@@ -304,31 +397,76 @@ struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
                                        accelOp->getOperandTypes().end());
         SmallVector<Type> resultTypes(accelOp->getResultTypes().begin(),
                                       accelOp->getResultTypes().end());
-        auto baseSymbolName = buildAcceleratorName(func, accelOp);
-        auto symbolName = uniquifySymbolName(symbolTable, baseSymbolName);
+        func::FuncOp symbol;
+        const bool isTiled =
+            accelOp->hasAttr(kIPTileSizeAttr) && isa<accel::GEMMOp>(accelOp);
+        const bool isSerialTiled =
+            isTiled &&
+            accelOp->getAttrOfType<StringAttr>(kIPTilingModeAttr) &&
+            accelOp->getAttrOfType<StringAttr>(kIPTilingModeAttr).getValue() ==
+                kSerialIPTilingMode;
 
-        builder.setInsertionPoint(func);
-        auto symbol = builder.create<func::FuncOp>(
-            func.getLoc(), symbolName,
-            builder.getFunctionType(operandTypes, resultTypes));
-        symbol->setAttr("sym_visibility",
-                        StringAttr::get(module.getContext(), "private"));
-        copyMappingAttrs(accelOp, symbol, accelOp);
-        symbolTable.insert(symbol);
+        if (auto gemmOp = dyn_cast<accel::GEMMOp>(accelOp)) {
+          auto resultType = dyn_cast<RankedTensorType>(gemmOp.getResult().getType());
+          if (resultType && resultType.getRank() == 3) {
+            if (failed(lowerBatchedGemmTo2DHelper(builder, symbolTable, func, gemmOp,
+                                                  symbol))) {
+              accelOp->emitError("failed to lower batched GEMM to 2D helper ABI");
+              signalPassFailure();
+              return;
+            }
+            outlinedSymbols.push_back(SymbolRefAttr::get(symbol));
+            continue;
+          }
+        }
+
+        if (isSerialTiled) {
+          std::string serialBaseName = buildAcceleratorName(func, accelOp);
+          if (auto tileSize = accelOp->getAttrOfType<StringAttr>(kIPTileSizeAttr))
+            serialBaseName += "_ip" + tileSize.getValue().str();
+          auto it = serialTileHelpers.find(serialBaseName);
+          if (it != serialTileHelpers.end()) {
+            symbol = it->second;
+          } else {
+            auto symbolName = uniquifySymbolName(symbolTable, serialBaseName);
+            builder.setInsertionPoint(func);
+            symbol = builder.create<func::FuncOp>(
+                func.getLoc(), symbolName,
+                builder.getFunctionType(operandTypes, resultTypes));
+            symbol->setAttr("sym_visibility",
+                            StringAttr::get(module.getContext(), "private"));
+            copyMappingAttrs(accelOp, symbol, accelOp);
+            symbolTable.insert(symbol);
+            serialTileHelpers.try_emplace(serialBaseName, symbol);
+            outlinedSymbols.push_back(SymbolRefAttr::get(symbol));
+          }
+        } else {
+          auto baseSymbolName =
+              isTiled ? buildTiledAcceleratorName(func, accelOp)
+                      : buildAcceleratorName(func, accelOp);
+          auto symbolName = uniquifySymbolName(symbolTable, baseSymbolName);
+          builder.setInsertionPoint(func);
+          symbol = builder.create<func::FuncOp>(
+              func.getLoc(), symbolName,
+              builder.getFunctionType(operandTypes, resultTypes));
+          symbol->setAttr("sym_visibility",
+                          StringAttr::get(module.getContext(), "private"));
+          copyMappingAttrs(accelOp, symbol, accelOp);
+          symbolTable.insert(symbol);
+          outlinedSymbols.push_back(SymbolRefAttr::get(symbol));
+        }
 
         builder.setInsertionPoint(accelOp);
         auto call = builder.create<func::CallOp>(accelOp->getLoc(), symbol,
                                                  accelOp->getOperands());
         accelOp->getResult(0).replaceAllUsesWith(call.getResult(0));
         accelOp->erase();
-        outlinedSymbols.push_back(SymbolRefAttr::get(symbol));
       }
 
       if (!outlinedSymbols.empty())
         func->setAttr(kOutlinedAttr, outlinedSymbols.front());
     }
   }
-
 private:
   LogicalResult lowerToFullDataABI(OpBuilder &builder, SymbolTable &symbolTable,
                                    func::FuncOp func, Operation *accelOp,
@@ -341,31 +479,26 @@ private:
       return failure();
     }
 
-    SmallVector<Value> flatOperands;
     builder.setInsertionPoint(accelOp);
     for (Value operand : accelOp->getOperands()) {
-      if (failed(flattenTensorOperand(builder, accelOp->getLoc(), operand,
-                                      flatOperands))) {
+      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!operandType || !operandType.hasStaticShape()) {
         accelOp->emitError()
             << "full-data ABI requires static ranked tensor operands";
         return failure();
       }
     }
-
-    SmallVector<Type> flatOperandTypes;
-    flatOperandTypes.reserve(flatOperands.size());
-    for (Value value : flatOperands)
-      flatOperandTypes.push_back(value.getType());
-
-    SmallVector<Type> flatResultTypes(resultType.getNumElements(),
-                                      resultType.getElementType());
     auto baseSymbolName = buildAcceleratorName(func, accelOp);
     auto symbolName = uniquifySymbolName(symbolTable, baseSymbolName);
+    SmallVector<Type> operandTypes(accelOp->getOperandTypes().begin(),
+                                   accelOp->getOperandTypes().end());
+    SmallVector<Type> resultTypes(accelOp->getResultTypes().begin(),
+                                  accelOp->getResultTypes().end());
 
     builder.setInsertionPoint(func);
     auto symbol = builder.create<func::FuncOp>(
         func.getLoc(), symbolName,
-        builder.getFunctionType(flatOperandTypes, flatResultTypes));
+        builder.getFunctionType(operandTypes, resultTypes));
     symbol->setAttr("sym_visibility",
                     StringAttr::get(func.getContext(), "private"));
     copyMappingAttrs(accelOp, symbol, accelOp);
@@ -373,18 +506,10 @@ private:
     outlinedSymbol = SymbolRefAttr::get(symbol);
 
     builder.setInsertionPoint(accelOp);
-    auto call = builder.create<func::CallOp>(accelOp->getLoc(), flatResultTypes,
-                                             symbol.getName(), flatOperands);
-
-    Value rebuiltTensor;
-    if (failed(rebuildTensorResultFromFlatValues(builder, accelOp->getLoc(),
-                                                 resultType, call.getResults(),
-                                                 rebuiltTensor))) {
-      accelOp->emitError()
-          << "failed to rebuild full-data ABI tensor result from scalar outputs";
-      return failure();
-    }
-    accelOp->getResult(0).replaceAllUsesWith(rebuiltTensor);
+    auto call = builder.create<func::CallOp>(accelOp->getLoc(), resultTypes,
+                                             symbol.getName(),
+                                             accelOp->getOperands());
+    accelOp->getResult(0).replaceAllUsesWith(call.getResult(0));
     accelOp->erase();
     return success();
   }

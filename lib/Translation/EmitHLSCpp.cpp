@@ -13,6 +13,7 @@
 #include "scalehls/Dialect/HLS/Visitor.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/raw_ostream.h"
+#include <set>
 
 using namespace mlir;
 using namespace scalehls;
@@ -81,6 +82,45 @@ static bool isFullDataABIMode(Operation *op) {
     }
   }
   return false;
+}
+
+static SmallString<32> getFullDataReturnStructName(func::FuncOp func) {
+  SmallString<32> name(func.getName());
+  name += "_ret_t";
+  return name;
+}
+
+static Type getFullDataReturnedType(func::FuncOp func) {
+  if (!isFullDataABIMode(func))
+    return Type();
+  if (func.getNumResults() == 1)
+    return func.getResultTypes().front();
+  if (func.getNumResults() == 0 && func.getNumArguments() > 0)
+    return func.getArgumentTypes().back();
+  return Type();
+}
+
+static void enumerateStaticIndexTuples(ArrayRef<int64_t> shape,
+                                       SmallVectorImpl<SmallVector<int64_t>> &all) {
+  all.clear();
+  if (shape.empty()) {
+    all.push_back({});
+    return;
+  }
+  SmallVector<int64_t> current(shape.size(), 0);
+  while (true) {
+    all.push_back(current);
+    int64_t dim = static_cast<int64_t>(shape.size()) - 1;
+    while (dim >= 0) {
+      ++current[dim];
+      if (current[dim] < shape[dim])
+        break;
+      current[dim] = 0;
+      --dim;
+    }
+    if (dim < 0)
+      break;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -319,8 +359,12 @@ private:
   void emitLoopDirectives(Operation *op);
   void emitArrayDirectives(Value memref);
   void emitFunctionDirectives(func::FuncOp func, ArrayRef<Value> portList);
+  void emitFullDataReturnStructDecl(func::FuncOp func);
+  void emitFullDataReturnStructDeclIfNeeded(func::FuncOp func);
   void emitFunctionDecl(func::FuncOp func);
   void emitFunction(func::FuncOp func);
+
+  std::set<std::string> emittedFullDataStructDecls;
 };
 } // namespace
 
@@ -813,6 +857,88 @@ void ModuleEmitter::emitAffineSelect(hls::AffineSelectOp op) {
 
 /// Control flow operation emitters.
 void ModuleEmitter::emitCall(func::CallOp op) {
+  if (isFullDataABIMode(op)) {
+    SmallString<32> retName("__scalehls_ret_" +
+                            std::to_string(state.nameTable.size()));
+    auto module = op->getParentOfType<ModuleOp>();
+    auto callee = module.lookupSymbol<func::FuncOp>(op.getCallee());
+    auto retStructName = getFullDataReturnStructName(callee);
+    bool returnsViaLastOperand =
+        callee && callee.getNumResults() == 0 && callee.getNumArguments() > 0 &&
+        callee.getArgumentTypes().back().isa<ShapedType>();
+
+    indent() << retStructName << " " << retName << " = " << op.getCallee()
+             << "(";
+    unsigned argIdx = 0;
+    unsigned visibleOperands =
+        op.getNumOperands() - (returnsViaLastOperand ? 1 : 0);
+    for (auto arg : op.getOperands().take_front(visibleOperands)) {
+      emitValue(arg);
+      if (argIdx++ != visibleOperands - 1)
+        os << ", ";
+    }
+    os << ");";
+    emitInfoAndNewLine(op);
+
+    if (returnsViaLastOperand) {
+      Value result = op.getOperand(op.getNumOperands() - 1);
+      auto shapedType = cast<ShapedType>(result.getType());
+      SmallVector<SmallVector<int64_t>> allIndices;
+      enumerateStaticIndexTuples(shapedType.getShape(), allIndices);
+      for (ArrayRef<int64_t> indices : allIndices) {
+        indent();
+        emitValue(result);
+        for (int64_t index : indices)
+          os << "[" << index << "]";
+        os << " = " << retName << ".data";
+        for (int64_t index : indices)
+          os << "[" << index << "]";
+        os << ";";
+        emitInfoAndNewLine(op);
+      }
+      return;
+    }
+
+    for (auto [resultIdx, result] : llvm::enumerate(op.getResults())) {
+      if (auto shapedType = dyn_cast<ShapedType>(result.getType())) {
+        if (!isDeclared(result)) {
+          indent();
+          emitArrayDecl(result);
+          os << ";\n";
+        }
+        if (op.getNumResults() == 1) {
+          SmallVector<SmallVector<int64_t>> allIndices;
+          enumerateStaticIndexTuples(shapedType.getShape(), allIndices);
+          for (ArrayRef<int64_t> indices : allIndices) {
+            indent();
+            emitValue(result);
+            for (int64_t index : indices)
+              os << "[" << index << "]";
+            os << " = " << retName << ".data";
+            for (int64_t index : indices)
+              os << "[" << index << "]";
+            os << ";";
+            emitInfoAndNewLine(op);
+          }
+        } else {
+          indent() << "/* unsupported multi-result full-data shaped return */";
+          emitInfoAndNewLine(op);
+        }
+      } else {
+        if (!isDeclared(result)) {
+          indent();
+          emitValue(result);
+          os << ";\n";
+        }
+        indent();
+        emitValue(result);
+        os << " = " << retName << ".result" << resultIdx << ";";
+        emitInfoAndNewLine(op);
+      }
+    }
+    return;
+  }
+
   // Handle returned value by the callee.
   for (auto result : op.getResults()) {
     if (!isDeclared(result)) {
@@ -840,7 +966,7 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   // Handle output arguments.
   for (auto result : op.getResults()) {
     // The address should be passed in for scalar result arguments.
-    if (result.getType().isa<ShapedType>() || isFullDataABIMode(op))
+    if (result.getType().isa<ShapedType>())
       os << ", ";
     else
       os << ", &";
@@ -1468,6 +1594,8 @@ template <typename OpType> void ModuleEmitter::emitReshape(OpType op) {
   assert(!isDeclared(array) && "has been declared before.");
 
   auto arrayType = array.getType().template cast<ShapedType>();
+  auto source = op->getOperand(0);
+  auto sourceType = source.getType().template dyn_cast<ShapedType>();
   indent() << getTypeName(array) << " (*";
 
   // Add the new value to nameTable and emit its name.
@@ -1477,12 +1605,27 @@ template <typename OpType> void ModuleEmitter::emitReshape(OpType op) {
   for (auto &shape : llvm::drop_begin(arrayType.getShape(), 1))
     os << "[" << shape << "]";
 
-  os << " = (" << getTypeName(array) << "(*)";
-  for (auto &shape : llvm::drop_begin(arrayType.getShape(), 1))
-    os << "[" << shape << "]";
-  os << ") ";
+  os << " = ";
 
-  emitValue(op->getOperand(0));
+  bool wholeArrayAlias = false;
+  if (sourceType && sourceType.hasStaticShape() && arrayType.hasStaticShape()) {
+    auto srcShape = sourceType.getShape();
+    auto dstShape = arrayType.getShape();
+    wholeArrayAlias =
+        srcShape.size() + 1 == dstShape.size() && dstShape.front() == 1 &&
+        llvm::equal(srcShape, llvm::drop_begin(dstShape));
+  }
+
+  if (wholeArrayAlias) {
+    os << "&";
+    emitValue(source);
+  } else {
+    os << "(" << getTypeName(array) << " (*)";
+    for (auto &shape : llvm::drop_begin(arrayType.getShape(), 1))
+      os << "[" << shape << "]";
+    os << ") ";
+    emitValue(source);
+  }
   os << ";";
   emitInfoAndNewLine(op);
 }
@@ -1894,11 +2037,53 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
   }
 }
 
+void ModuleEmitter::emitFullDataReturnStructDecl(func::FuncOp func) {
+  if (!isFullDataABIMode(func))
+    return;
+  Type returnedType = getFullDataReturnedType(func);
+  if (func.getNumResults() == 0 && !returnedType)
+    return;
+  os << "struct " << getFullDataReturnStructName(func) << " {\n";
+  addIndent();
+  if (returnedType && dyn_cast<ShapedType>(returnedType)) {
+      auto shapedType = cast<ShapedType>(returnedType);
+      indent() << getTypeName(returnedType) << " data";
+      for (auto dim : shapedType.getShape())
+        os << "[" << dim << "]";
+      os << ";\n";
+  } else {
+    if (func.getNumResults() == 1 && returnedType)
+      indent() << getTypeName(returnedType) << " result0;\n";
+    else
+      for (auto [resultIdx, resultType] : llvm::enumerate(func.getResultTypes()))
+        indent() << getTypeName(resultType) << " result" << resultIdx << ";\n";
+  }
+  reduceIndent();
+  os << "};\n\n";
+}
+
+void ModuleEmitter::emitFullDataReturnStructDeclIfNeeded(func::FuncOp func) {
+  if (!isFullDataABIMode(func))
+    return;
+  if (func.getNumResults() == 0 &&
+      (func.getNumArguments() == 0 ||
+       !func.getArgumentTypes().back().isa<ShapedType>()))
+    return;
+  std::string name = std::string(getFullDataReturnStructName(func).str());
+  if (emittedFullDataStructDecls.insert(name).second)
+    emitFullDataReturnStructDecl(func);
+}
+
 void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
   if (!func.isExternal())
     return;
 
-  os << "void " << func.getName() << "(\n";
+  emitFullDataReturnStructDeclIfNeeded(func);
+
+  if (isFullDataABIMode(func))
+    os << getFullDataReturnStructName(func) << " " << func.getName() << "(\n";
+  else
+    os << "void " << func.getName() << "(\n";
   addIndent();
 
   unsigned portIdx = 0;
@@ -1907,8 +2092,15 @@ void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
       os << ",\n";
   };
 
-  unsigned totalPorts = func.getNumArguments() + func.getNumResults();
-  for (auto [argIdx, argType] : llvm::enumerate(func.getArgumentTypes())) {
+  bool elideLastArgAsReturn =
+      isFullDataABIMode(func) && func.getNumResults() == 0 &&
+      func.getNumArguments() > 0 &&
+      func.getArgumentTypes().back().isa<ShapedType>();
+  unsigned visibleArgs =
+      func.getNumArguments() - (elideLastArgAsReturn ? 1 : 0);
+  unsigned totalPorts = visibleArgs;
+  for (auto [argIdx, argType] :
+       llvm::enumerate(func.getArgumentTypes().take_front(visibleArgs))) {
     indent();
     if (auto shapedType = dyn_cast<ShapedType>(argType)) {
       os << getTypeName(argType) << " arg" << argIdx;
@@ -1921,19 +2113,20 @@ void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
     }
     emitPortSeparator(portIdx++, totalPorts);
   }
-
-  for (auto [resultIdx, resultType] : llvm::enumerate(func.getResultTypes())) {
-    indent();
-    if (auto shapedType = dyn_cast<ShapedType>(resultType)) {
-      os << getTypeName(resultType) << " result" << resultIdx;
-      for (auto dim : shapedType.getShape())
-        os << "[" << dim << "]";
-    } else if (isFullDataABIMode(func)) {
-      os << getTypeName(resultType) << " &result" << resultIdx;
-    } else {
-      os << getTypeName(resultType) << " *result" << resultIdx;
+  if (!isFullDataABIMode(func)) {
+    totalPorts += func.getNumResults();
+    portIdx = func.getNumArguments();
+    for (auto [resultIdx, resultType] : llvm::enumerate(func.getResultTypes())) {
+      indent();
+      if (auto shapedType = dyn_cast<ShapedType>(resultType)) {
+        os << getTypeName(resultType) << " result" << resultIdx;
+        for (auto dim : shapedType.getShape())
+          os << "[" << dim << "]";
+      } else {
+        os << getTypeName(resultType) << " *result" << resultIdx;
+      }
+      emitPortSeparator(portIdx++, totalPorts);
     }
-    emitPortSeparator(portIdx++, totalPorts);
   }
   reduceIndent();
   os << "\n);\n\n";
@@ -1942,6 +2135,8 @@ void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
 void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (func.getBlocks().size() != 1)
     emitError(func, "has zero or more than one basic blocks.");
+
+  emitFullDataReturnStructDeclIfNeeded(func);
 
   if (hasTopFuncAttr(func))
     os << "/// This is top function.\n";
@@ -1960,15 +2155,24 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
   }
 
   // Emit function signature.
-  os << "void " << func.getName() << "(\n";
+  if (isFullDataABIMode(func))
+    os << getFullDataReturnStructName(func) << " " << func.getName() << "(\n";
+  else
+    os << "void " << func.getName() << "(\n";
   addIndent();
 
   // This vector is to record all ports of the function.
   SmallVector<Value, 8> portList;
 
   // Emit input arguments.
+  bool elideLastArgAsReturn =
+      isFullDataABIMode(func) && func.getNumResults() == 0 &&
+      func.getNumArguments() > 0 &&
+      func.getArgumentTypes().back().isa<ShapedType>();
+  unsigned visibleArgs =
+      func.getNumArguments() - (elideLastArgAsReturn ? 1 : 0);
   unsigned argIdx = 0;
-  for (auto &arg : func.getArguments()) {
+  for (auto &arg : func.getArguments().take_front(visibleArgs)) {
     indent();
     if (arg.getType().isa<ShapedType>())
       emitArrayDecl(arg);
@@ -1983,24 +2187,23 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
       emitValue(arg);
 
     portList.push_back(arg);
-    if (argIdx++ != func.getNumArguments() - 1)
+    if (argIdx++ != visibleArgs - 1)
       os << ",\n";
   }
 
   // Emit results.
   auto funcReturn = cast<func::ReturnOp>(func.front().getTerminator());
-  for (auto result : funcReturn.getOperands()) {
-    os << ",\n";
-    indent();
-    // TODO: a known bug, cannot return a value twice, e.g. return %0, %0 :
-    // index, index. However, typically this should not happen.
-    if (result.getType().isa<ShapedType>())
-      emitArrayDecl(result);
-    else
-      // In Vivado HLS, pointer indicates the value is an output.
-      emitValue(result, /*rank=*/0, /*isPtr=*/true);
+  if (!isFullDataABIMode(func)) {
+    for (auto result : funcReturn.getOperands()) {
+      os << ",\n";
+      indent();
+      if (result.getType().isa<ShapedType>())
+        emitArrayDecl(result);
+      else
+        emitValue(result, /*rank=*/0, /*isPtr=*/true);
 
-    portList.push_back(result);
+      portList.push_back(result);
+    }
   }
 
   reduceIndent();
@@ -2012,6 +2215,31 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
 
   emitFunctionDirectives(func, portList);
   emitBlock(func.front());
+  if (isFullDataABIMode(func)) {
+    indent() << getFullDataReturnStructName(func) << " ret;\n";
+    if (funcReturn.getNumOperands() == 1 &&
+        funcReturn.getOperand(0).getType().isa<ShapedType>()) {
+      auto result = funcReturn.getOperand(0);
+      auto shapedType = cast<ShapedType>(result.getType());
+      SmallVector<SmallVector<int64_t>> allIndices;
+      enumerateStaticIndexTuples(shapedType.getShape(), allIndices);
+      for (ArrayRef<int64_t> indices : allIndices) {
+        indent() << "ret.data";
+        for (int64_t index : indices)
+          os << "[" << index << "]";
+        os << " = ";
+        emitValue(result);
+        for (int64_t index : indices)
+          os << "[" << index << "]";
+        os << ";\n";
+      }
+    } else for (auto [resultIdx, result] : llvm::enumerate(funcReturn.getOperands())) {
+      indent() << "ret.result" << resultIdx << " = ";
+      emitValue(result);
+      os << ";\n";
+    }
+    indent() << "return ret;\n";
+  }
   reduceIndent();
   os << "}\n";
 
