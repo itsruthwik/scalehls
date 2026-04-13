@@ -43,7 +43,6 @@ constexpr StringLiteral kPointerTransportAttr =
     "scalehls.accelerator_pointer_transport";
 constexpr StringLiteral kUntiledPointerTransport = "untiled";
 constexpr StringLiteral kTiledPointerTransport = "tiled_persistent";
-constexpr StringLiteral kABIModeAttr = "scalehls.accelerator_abi_mode";
 constexpr StringLiteral kIPTileSizeAttr = "scalehls.accelerator_ip_tile_size";
 constexpr StringLiteral kIPTilingModeAttr = "scalehls.accelerator_ip_tiling_mode";
 constexpr StringLiteral kIPTileRowAttr = "scalehls.accelerator_ip_tile_row";
@@ -191,7 +190,7 @@ static void copyMappingAttrs(Operation *from, Operation *to, Operation *accelOp)
        kBShapeAttr, kCShapeAttr, kBiasShapeAttr, kAArgAttr, kBArgAttr,
         kCArgAttr, kBiasArgAttr, kPrecisionAttr, kElementBitsAttr,
         kElementBytesAttr, kHasBiasAttr, kPointerTransportAttr,
-        kABIModeAttr, kIPTileSizeAttr, kIPTilingModeAttr, kIPTileRowAttr,
+        kIPTileSizeAttr, kIPTilingModeAttr, kIPTileRowAttr,
         kIPTileColAttr, kIPTileKAttr}) {
     if (auto attr = from->getAttr(attrName))
       to->setAttr(attrName, attr);
@@ -240,7 +239,7 @@ static Value expandLeadingBatchSlice(OpBuilder &builder, Location loc, Value sli
 
 struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
   LowerAccelToCalls() = default;
-  LowerAccelToCalls(std::string, unsigned maxElementsValue) {
+  LowerAccelToCalls(unsigned maxElementsValue) {
     maxElements = maxElementsValue;
   }
 
@@ -372,10 +371,6 @@ struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
       SmallVector<Attribute> outlinedSymbols;
       llvm::StringMap<func::FuncOp> serialTileHelpers;
       for (Operation *accelOp : accelOps) {
-        StringRef selectedABIMode = "pointer";
-        accelOp->setAttr(kABIModeAttr,
-                         StringAttr::get(module.getContext(), selectedABIMode));
-
         auto outputElements = getStaticElementCount(accelOp->getResult(0));
         const bool useTiledPointer =
             maxElements != 0 && outputElements && *outputElements > maxElements;
@@ -467,56 +462,10 @@ struct LowerAccelToCalls : public LowerAccelToCallsBase<LowerAccelToCalls> {
         func->setAttr(kOutlinedAttr, outlinedSymbols.front());
     }
   }
-private:
-  LogicalResult lowerToFullDataABI(OpBuilder &builder, SymbolTable &symbolTable,
-                                   func::FuncOp func, Operation *accelOp,
-                                   SymbolRefAttr &outlinedSymbol) {
-    auto resultType =
-        dyn_cast<RankedTensorType>(accelOp->getResult(0).getType());
-    if (!resultType || !resultType.hasStaticShape()) {
-      accelOp->emitError()
-          << "full-data ABI requires a static ranked tensor result";
-      return failure();
-    }
-
-    builder.setInsertionPoint(accelOp);
-    for (Value operand : accelOp->getOperands()) {
-      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
-      if (!operandType || !operandType.hasStaticShape()) {
-        accelOp->emitError()
-            << "full-data ABI requires static ranked tensor operands";
-        return failure();
-      }
-    }
-    auto baseSymbolName = buildAcceleratorName(func, accelOp);
-    auto symbolName = uniquifySymbolName(symbolTable, baseSymbolName);
-    SmallVector<Type> operandTypes(accelOp->getOperandTypes().begin(),
-                                   accelOp->getOperandTypes().end());
-    SmallVector<Type> resultTypes(accelOp->getResultTypes().begin(),
-                                  accelOp->getResultTypes().end());
-
-    builder.setInsertionPoint(func);
-    auto symbol = builder.create<func::FuncOp>(
-        func.getLoc(), symbolName,
-        builder.getFunctionType(operandTypes, resultTypes));
-    symbol->setAttr("sym_visibility",
-                    StringAttr::get(func.getContext(), "private"));
-    copyMappingAttrs(accelOp, symbol, accelOp);
-    symbolTable.insert(symbol);
-    outlinedSymbol = SymbolRefAttr::get(symbol);
-
-    builder.setInsertionPoint(accelOp);
-    auto call = builder.create<func::CallOp>(accelOp->getLoc(), resultTypes,
-                                             symbol.getName(),
-                                             accelOp->getOperands());
-    accelOp->getResult(0).replaceAllUsesWith(call.getResult(0));
-    accelOp->erase();
-    return success();
-  }
 };
 } // namespace
 
-std::unique_ptr<Pass> scalehls::createLowerAccelToCallsPass(std::string abiMode,
-                                                            unsigned maxElements) {
-  return std::make_unique<LowerAccelToCalls>(std::move(abiMode), maxElements);
+std::unique_ptr<Pass> scalehls::createLowerAccelToCallsPass(
+    unsigned maxElements) {
+  return std::make_unique<LowerAccelToCalls>(maxElements);
 }

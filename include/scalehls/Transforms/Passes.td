@@ -215,15 +215,29 @@ def LowerAffineToAccel :
       Pass<"lower-affine-to-accel", "func::FuncOp"> {
   let summary = "Lower strict affine GEMM patterns into accel dialect ops";
   let constructor = "mlir::scalehls::createLowerAffineToAccelPass()";
+  let options = [
+    Option<"gemmOnly", "gemm-only", "bool", /*default=*/"false",
+           "Disable GEMMV/CONV accel formation and lower supported cases through GEMM semantics instead">
+  ];
+}
+
+def TileAccelGemm :
+      Pass<"tile-accel-gemm", "func::FuncOp"> {
+  let summary = "Tile accel.gemm ops into smaller accel.gemm ops";
+  let constructor = "mlir::scalehls::createTileAccelGemmPass()";
+  let options = [
+    Option<"ipSize", "ip-size", "std::string", /*default=*/"\"\"",
+           "GEMM IP tile size as MxNxK; empty keeps accel.gemm untiled">,
+    Option<"serial", "serial", "bool", /*default=*/"false",
+           "Mark tiled accel.gemm ops for serial helper reuse instead of spatial replication">
+  ];
 }
 
 def LowerAccelToCalls :
       Pass<"lower-accel-to-calls", "mlir::ModuleOp"> {
-  let summary = "Lower accel dialect ops into selected physical ABI form";
+  let summary = "Lower accel dialect ops into the default array-argument physical ABI form";
   let constructor = "mlir::scalehls::createLowerAccelToCallsPass()";
   let options = [
-    Option<"abiMode", "abi-mode", "std::string", /*default=*/"\"pointer\"",
-           "Physical ABI lowering mode: pointer, full-data, or stream">,
     Option<"maxElements", "max-elements", "unsigned", /*default=*/"0",
            "Maximum logical output elements for untiled pointer lowering; 0 disables the threshold">
   ];
@@ -434,6 +448,18 @@ def LowerCopyToAffine : Pass<"scalehls-lower-copy-to-affine", "func::FuncOp"> {
     Option<"internalCopyOnly", "internal-copy-only", "bool",
            /*default=*/"false", "only convert copy between internal buffers">
   ];
+}
+
+def FoldStaticSubviewIntoAffine :
+      Pass<"scalehls-fold-static-subview-into-affine", "func::FuncOp"> {
+  let summary = "Fold affine loads and stores on static subviews into the source memref";
+  let constructor = "mlir::scalehls::createFoldStaticSubviewIntoAffinePass()";
+}
+
+def FoldEmptyTensorToMemrefAlloc :
+      Pass<"scalehls-fold-empty-tensor-to-memref-alloc", "func::FuncOp"> {
+  let summary = "Fold tensor.empty/bufferization.to_memref seeds into plain memref.alloc";
+  let constructor = "mlir::scalehls::createFoldEmptyTensorToMemrefAllocPass()";
 }
 
 def RaiseAffineToCopy : Pass<"scalehls-raise-affine-to-copy", "func::FuncOp"> {

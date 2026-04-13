@@ -72,9 +72,10 @@ std::unique_ptr<Pass> createStreamDataflowTaskPass();
 /// Tensor-related passes.
 std::unique_ptr<Pass> createConvertTensorToLinalgPass();
 std::unique_ptr<Pass> createLinalgAnalyzeModelPass();
-std::unique_ptr<Pass> createLowerAffineToAccelPass();
-std::unique_ptr<Pass> createLowerAccelToCallsPass(std::string abiMode = "pointer",
-                                                  unsigned maxElements = 0);
+std::unique_ptr<Pass> createLowerAffineToAccelPass(bool gemmOnly = false);
+std::unique_ptr<Pass> createTileAccelGemmPass(std::string ipSize = "",
+                                              bool serial = false);
+std::unique_ptr<Pass> createLowerAccelToCallsPass(unsigned maxElements = 0);
 std::unique_ptr<Pass> createLowerLinalgToAccelPass();
 std::unique_ptr<Pass> createLinalgFakeQuantizePass();
 std::unique_ptr<Pass> createTosaFakeQuantizePass();
@@ -105,6 +106,8 @@ std::unique_ptr<Pass> createCreateMemrefSubviewPass(
     CreateSubviewMode createSubviewMode = CreateSubviewMode::Point);
 std::unique_ptr<Pass>
 createLowerCopyToAffinePass(bool internalCopyOnly = false);
+std::unique_ptr<Pass> createFoldStaticSubviewIntoAffinePass();
+std::unique_ptr<Pass> createFoldEmptyTensorToMemrefAllocPass();
 std::unique_ptr<Pass> createRaiseAffineToCopyPass();
 std::unique_ptr<Pass> createReduceInitialIntervalPass();
 std::unique_ptr<Pass> createSimplifyAffineIfPass();

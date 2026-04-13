@@ -55,13 +55,21 @@ struct ScaleHLSCAccelPipelineOptions
       *this, "candidate-log", llvm::cl::init(""),
       llvm::cl::desc("Path for aggregate accelerator candidate log JSON file")};
 
-  Option<std::string> abiMode{
-      *this, "abi-mode", llvm::cl::init("pointer"),
-      llvm::cl::desc("Physical ABI lowering mode: pointer, full-data, or stream")};
-
   Option<unsigned> maxElements{
       *this, "max-elements", llvm::cl::init(0),
       llvm::cl::desc("Maximum logical output elements for untiled pointer lowering; 0 disables the threshold")};
+
+  Option<std::string> ipSize{
+      *this, "ip-size", llvm::cl::init(""),
+      llvm::cl::desc("GEMM IP tile size as MxNxK; empty keeps accel.gemm untiled")};
+
+  Option<bool> serial{
+      *this, "serial", llvm::cl::init(false),
+      llvm::cl::desc("Mark tiled accel.gemm ops for serial helper reuse")};
+
+  Option<bool> gemmOnly{
+      *this, "gemm-only", llvm::cl::init(false),
+      llvm::cl::desc("Disable GEMMV/CONV accel formation and lower supported cases through GEMM semantics instead")};
 };
 } // namespace
 
@@ -89,9 +97,10 @@ void scalehls::registerScaleHLSCAccelPipeline() {
       "Lower canonical C/C++ affine accelerator regions into pointer-call form",
       [](OpPassManager &pm, const ScaleHLSCAccelPipelineOptions &opts) {
         pm.addPass(scalehls::createFuncPreprocessPass(opts.hlsTopFunc));
-        pm.addPass(scalehls::createLowerAffineToAccelPass());
-        pm.addPass(scalehls::createLowerAccelToCallsPass(opts.abiMode,
-                                                         opts.maxElements));
+        pm.addPass(scalehls::createLowerAffineToAccelPass(opts.gemmOnly));
+        pm.addPass(scalehls::createTileAccelGemmPass(opts.ipSize,
+                                                     opts.serial));
+        pm.addPass(scalehls::createLowerAccelToCallsPass(opts.maxElements));
         if (!opts.manifestDir.empty() || !opts.candidateLog.empty())
           pm.addPass(scalehls::createExportAccelReportPass(opts.manifestDir,
                                                            opts.candidateLog));
@@ -100,6 +109,10 @@ void scalehls::registerScaleHLSCAccelPipeline() {
         pm.addPass(mlir::createTensorBufferizePass());
         pm.addPass(func::createFuncBufferizePass());
         pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+        pm.addPass(scalehls::createFoldEmptyTensorToMemrefAllocPass());
+        pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
+        pm.addPass(scalehls::createLowerCopyToAffinePass(false));
+        pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
         pm.addPass(mlir::createCanonicalizerPass());
       });
 }
@@ -179,6 +192,14 @@ struct ScaleFlowPyTorchPipelineOptions
       llvm::cl::desc(
           "Run accelerator-family mapping after initial preprocessing")};
 
+  Option<std::string> ipSize{
+      *this, "ip-size", llvm::cl::init(""),
+      llvm::cl::desc("GEMM IP tile size as MxNxK; empty keeps accel.gemm untiled")};
+
+  Option<bool> serial{
+      *this, "serial", llvm::cl::init(false),
+      llvm::cl::desc("Mark tiled accel.gemm ops for serial helper reuse")};
+
   Option<unsigned> debugPoint{
       *this, "debug-point", llvm::cl::init(0),
       llvm::cl::desc("Stop the pipeline at the given debug point")};
@@ -242,13 +263,17 @@ struct ScaleFlowPyTorchGemmPipelineOptions
       *this, "candidate-log", llvm::cl::init(""),
       llvm::cl::desc("Path for aggregate accelerator candidate log JSON file")};
 
-  Option<std::string> abiMode{
-      *this, "abi-mode", llvm::cl::init("pointer"),
-      llvm::cl::desc("Physical ABI lowering mode: pointer, full-data, or stream")};
-
   Option<unsigned> maxElements{
       *this, "max-elements", llvm::cl::init(0),
       llvm::cl::desc("Maximum logical output elements for untiled pointer lowering; 0 disables the threshold")};
+
+  Option<std::string> ipSize{
+      *this, "ip-size", llvm::cl::init(""),
+      llvm::cl::desc("GEMM IP tile size as MxNxK; empty keeps accel.gemm untiled")};
+
+  Option<bool> serial{
+      *this, "serial", llvm::cl::init(false),
+      llvm::cl::desc("Mark tiled accel.gemm ops for serial helper reuse")};
 
   Option<unsigned> debugPoint{
       *this, "debug-point", llvm::cl::init(0),
@@ -263,8 +288,9 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
                                               bool createLinalgDataflow = true,
                                               StringRef manifestDir = "",
                                               StringRef candidateLog = "",
-                                              StringRef abiMode = "pointer",
-                                              unsigned maxElements = 0) {
+                                              unsigned maxElements = 0,
+                                              StringRef ipSize = "",
+                                              bool serial = false) {
   const bool runAccelMapper = enableGemmMapper;
 
   if (opts.tosaInput) {
@@ -298,8 +324,8 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   // tensor contractions before bufferization destroys the linalg/tensor form.
   if (runAccelMapper) {
     pm.addPass(scalehls::createLowerLinalgToAccelPass());
-    pm.addPass(
-        scalehls::createLowerAccelToCallsPass(abiMode.str(), maxElements));
+    pm.addPass(scalehls::createTileAccelGemmPass(ipSize.str(), serial));
+    pm.addPass(scalehls::createLowerAccelToCallsPass(maxElements));
     if (!manifestDir.empty() || !candidateLog.empty())
       pm.addPass(scalehls::createExportAccelReportPass(manifestDir.str(),
                                                        candidateLog.str()));
@@ -315,6 +341,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   pm.addPass(mlir::createTensorBufferizePass());
   pm.addPass(func::createFuncBufferizePass());
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+  pm.addPass(scalehls::createFoldEmptyTensorToMemrefAllocPass());
   pm.addPass(scalehls::createBufferizeDataflowPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -326,6 +353,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   pm.addPass(scalehls::createSimplifyCopyPass());
   pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
   pm.addPass(scalehls::createLowerCopyToAffinePass());
+  pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -340,6 +368,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   pm.addPass(scalehls::createRaiseAffineToCopyPass());
   pm.addPass(scalehls::createSimplifyCopyPass());
   pm.addPass(scalehls::createLowerCopyToAffinePass());
+  pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -368,6 +397,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   scalehls::addCreateSubviewPasses(pm);
   pm.addPass(scalehls::createCreateLocalBufferPass());
   pm.addPass(scalehls::createLowerCopyToAffinePass());
+  pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(mlir::createSimplifyAffineStructuresPass());
   pm.addPass(mlir::createCanonicalizerPass());
@@ -393,6 +423,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   if (opts.balanceDataflow.getValue())
     pm.addPass(scalehls::createBalanceDataflowNodePass());
   pm.addPass(scalehls::createLowerCopyToAffinePass());
+  pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
   pm.addPass(scalehls::createAffineStoreForwardPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -455,8 +486,8 @@ void scalehls::registerScaleFlowPyTorchAccelPipeline() {
         buildScaleFlowPyTorchPipelineBody(pm, opts, /*enableGemmMapper=*/true,
                                           /*createLinalgDataflow=*/false,
                                           opts.manifestDir, opts.candidateLog,
-                                          opts.abiMode,
-                                          opts.maxElements);
+                                          opts.maxElements, opts.ipSize,
+                                          opts.serial);
       });
 }
 
@@ -523,6 +554,8 @@ void scalehls::registerScaleFlowCppPipeline() {
         pm.addPass(scalehls::createFuncPreprocessPass(opts.hlsTopFunc));
         if (opts.accelMapper) {
           pm.addPass(scalehls::createLowerAffineToAccelPass());
+          pm.addPass(scalehls::createTileAccelGemmPass(opts.ipSize,
+                                                       opts.serial));
           pm.addPass(scalehls::createLowerAccelToCallsPass());
           pm.addPass(mlir::createCanonicalizerPass());
         }
@@ -532,6 +565,7 @@ void scalehls::registerScaleFlowCppPipeline() {
         pm.addPass(scalehls::createRaiseAffineToCopyPass());
         pm.addPass(scalehls::createSimplifyCopyPass());
         pm.addPass(scalehls::createLowerCopyToAffinePass());
+        pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
         pm.addPass(memref::createFoldMemRefAliasOpsPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
@@ -591,6 +625,7 @@ void scalehls::registerScaleFlowCppPipeline() {
         pm.addPass(scalehls::createScheduleDataflowNodePass());
         pm.addPass(scalehls::createBalanceDataflowNodePass());
         pm.addPass(scalehls::createLowerCopyToAffinePass());
+        pm.addPass(scalehls::createFoldStaticSubviewIntoAffinePass());
         pm.addPass(scalehls::createAffineStoreForwardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
