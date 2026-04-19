@@ -14,18 +14,15 @@
 #define OH 8
 #define OW 8
 
-// Equivalent im2col GEMM:
-//   M = 8
-//   K = 72
-//   N = 64
-extern "C" void conv2d_10x10x8_k3_oc8_int8(int8_t O[N][OC][OH][OW],
-                                           int8_t I[N][IC][IH][IW],
-                                           int8_t W[OC][IC][KH][KW]) {
+void conv2d_10x10x8_k3_oc8_int8(int8_t O[N][OC][OH][OW],
+                                int8_t I[N][IC][IH][IW],
+                                int8_t W[OC][IC][KH][KW]) {
+  int32_t ACC[N][OC][OH][OW];
+
   for (int n = 0; n < N; ++n) {
     for (int oc = 0; oc < OC; ++oc) {
       for (int oh = 0; oh < OH; ++oh) {
         for (int ow = 0; ow < OW; ++ow) {
-          // int32_t acc = (int32_t)O[n][oc][oh][ow];
           int32_t acc = 0;
           for (int ic = 0; ic < IC; ++ic) {
             for (int kh = 0; kh < KH; ++kh) {
@@ -35,7 +32,23 @@ extern "C" void conv2d_10x10x8_k3_oc8_int8(int8_t O[N][OC][OH][OW],
               }
             }
           }
-          O[n][oc][oh][ow] = (int8_t)acc;
+          ACC[n][oc][oh][ow] = acc;
+        }
+      }
+    }
+  }
+
+  for (int n = 0; n < N; ++n) {
+    for (int oc = 0; oc < OC; ++oc) {
+      for (int oh = 0; oh < OH; ++oh) {
+        for (int ow = 0; ow < OW; ++ow) {
+          int32_t value = ACC[n][oc][oh][ow];
+          value = (value + 64) >> 7;
+          if (value > 127)
+            value = 127;
+          if (value < -128)
+            value = -128;
+          O[n][oc][oh][ow] = (int8_t)value;
         }
       }
     }
