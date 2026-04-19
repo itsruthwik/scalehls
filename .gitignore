@@ -30,3 +30,6 @@ py-designs-ml/layers/artifacts/
 test/Validation/
 py-designs-ml/
 c-designs-ml/archive/
+c-designs-ml/micro-bench/results
+
+old-files/
