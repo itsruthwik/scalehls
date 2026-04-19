@@ -11,7 +11,14 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parents[1]
 TOOL = REPO_ROOT / "tools" / "scalehls-c-to-cpp.py"
-ARTIFACT_ROOT = REPO_ROOT / "conductor" / "tracks" / "shared_accelerator_family_ir_20260411" / "artifacts" / "c_test_matrix"
+ARTIFACT_ROOT = (
+    REPO_ROOT
+    / "conductor"
+    / "tracks"
+    / "gemm_only_accel_stack_revision_20260414"
+    / "artifacts"
+    / "c_test_matrix"
+)
 
 
 def main() -> int:

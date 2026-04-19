@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the canonical C accelerator-family samples through the C frontend."""
+"""Validate the canonical GEMM-mapped C samples through the C frontend."""
 
 from __future__ import annotations
 
@@ -27,13 +27,13 @@ TRACK_ARTIFACT_ROOT = (
     / "c_design_validation"
 )
 
-LAYERS_DIR = THIS_DIR / "layers"
+TEST_DIR = THIS_DIR / "test"
 ARCHIVE_DIR = THIS_DIR / "archive"
 
 
 def resolve_design_path(name: str) -> Path:
     path_name = name if name.endswith(".cpp") else f"{name}.cpp"
-    for base in (LAYERS_DIR, THIS_DIR, ARCHIVE_DIR):
+    for base in (TEST_DIR, THIS_DIR, ARCHIVE_DIR):
         candidate = base / path_name
         if candidate.exists():
             return candidate
@@ -44,9 +44,9 @@ def discover_designs(designs: list[str] | None) -> list[Path]:
     if designs:
         return [resolve_design_path(name) for name in designs]
     return [
-        LAYERS_DIR / "gemmv_fp32.cpp",
-        LAYERS_DIR / "gemm_fp32.cpp",
-        LAYERS_DIR / "conv2d_fp32.cpp",
+        TEST_DIR / "gemmv_fp32.cpp",
+        TEST_DIR / "gemm_fp32.cpp",
+        TEST_DIR / "conv2d_fp32.cpp",
     ]
 
 
@@ -108,8 +108,8 @@ def render_markdown_report(summary: dict) -> str:
             "## Notes",
             "",
             "- Validation uses the reusable C frontend harness in `tools/scalehls-c-to-cpp.py` with `--pipeline-mode accel`.",
-            "- The active design set is limited to canonical accelerator-family C samples under `c-designs-ml/layers/`.",
-            "- Archived older or exploratory C designs are kept under `c-designs-ml/archive/`.",
+            "- The active design set is limited to canonical GEMM-mapped C samples under `c-designs-ml/test/`.",
+            "- Archived older or exploratory C designs are kept under `c-designs-ml/archive/` when needed.",
             "",
             "## Per-Design Artifacts",
             "",
