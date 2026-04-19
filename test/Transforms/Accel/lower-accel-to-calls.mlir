@@ -1,51 +1,80 @@
-// RUN: scalehls-opt -split-input-file -lower-accel-to-calls %s | FileCheck %s
-// RUN: not scalehls-opt -split-input-file -lower-accel-to-calls="max-elements=64" %s 2>&1 | FileCheck %s --check-prefix=TILED-FAIL
+// RUN: scalehls-opt %s -lower-accel-to-calls | FileCheck %s
 
-// CHECK: func.func private @forward_accel_gemmv_f32_in8x32_w32x16_out8x16
+// CHECK-LABEL: func.func private @gemm_8x32x16_call0(
+// CHECK-SAME: scalehls.gemm_a_arg = 0 : i64
+// CHECK-SAME: scalehls.gemm_b_arg = 1 : i64
 // CHECK-LABEL: func.func @forward(
-// CHECK-SAME: scalehls.gemm_outlined = @forward_accel_gemmv_f32_in8x32_w32x16_out8x16
-// CHECK: %[[CALL:.*]] = call @forward_accel_gemmv_f32_in8x32_w32x16_out8x16(%arg0, %arg1) : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
-// CHECK: return %[[CALL]]
+// CHECK: scalehls.gemm_outlined = @gemm_8x32x16_call0
+// CHECK: %[[CALL:.*]] = call @gemm_8x32x16_call0(%arg0, %arg1) : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
 func.func @forward(%arg0: tensor<8x32xf32>, %arg1: tensor<32x16xf32>) -> tensor<8x16xf32> {
-  %0 = "accel.gemmv"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>} : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
+  %0 = "accel.gemm"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>} : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
   return %0 : tensor<8x16xf32>
 }
 
 // -----
 
-// CHECK-LABEL: func.func private @conv_bias_accel_conv_f32_in1x32x10x10_w64x32x3x3_b64_out1x64x8x8(
-// CHECK-LABEL: func.func @conv_bias(
-// CHECK: call @conv_bias_accel_conv_f32_in1x32x10x10_w64x32x3x3_b64_out1x64x8x8(%arg0, %arg1, %arg2)
-func.func @conv_bias(%arg0: tensor<1x32x10x10xf32>, %arg1: tensor<64x32x3x3xf32>, %arg2: tensor<64xf32>) -> tensor<1x64x8x8xf32> {
-  %0 = "accel.conv"(%arg0, %arg1, %arg2) {dilations = array<i64: 1, 1>, operand_segment_sizes = array<i32: 1, 1, 1, 0>, strides = array<i64: 1, 1>} : (tensor<1x32x10x10xf32>, tensor<64x32x3x3xf32>, tensor<64xf32>) -> tensor<1x64x8x8xf32>
-  return %0 : tensor<1x64x8x8xf32>
+// CHECK-LABEL: func.func private @gemm_8x16x16_call0(
+// CHECK-LABEL: func.func @with_bias(
+// CHECK: scalehls.gemm_outlined = @gemm_8x16x16_call0
+// CHECK: call @gemm_8x16x16_call0(%arg0, %arg1, %arg2)
+func.func @with_bias(%arg0: tensor<8x16xf32>, %arg1: tensor<16x16xf32>, %arg2: tensor<16xf32>) -> tensor<8x16xf32> {
+  %0 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 1, 0>} : (tensor<8x16xf32>, tensor<16x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
 }
 
 // -----
 
-// CHECK-LABEL: func.func private @batch_existing_input_accel_gemm_f32_in8x32_w32x16_ei8x16_out8x16(
-// CHECK-LABEL: func.func @batch_existing_input(
-// CHECK: %[[LOOP:.*]] = scf.for
-// CHECK: %[[A_SLICE:.*]] = tensor.extract_slice %arg0
-// CHECK: %[[A2D:.*]] = tensor.collapse_shape %[[A_SLICE]]
-// CHECK: %[[B_SLICE:.*]] = tensor.extract_slice %arg1
-// CHECK: %[[B2D:.*]] = tensor.collapse_shape %[[B_SLICE]]
-// CHECK: %[[C_SLICE:.*]] = tensor.extract_slice %arg4
-// CHECK: %[[C2D:.*]] = tensor.collapse_shape %[[C_SLICE]]
-// CHECK: %[[CALL:.*]] = func.call @batch_existing_input_accel_gemm_f32_in8x32_w32x16_ei8x16_out8x16(%[[A2D]], %[[B2D]], %[[C2D]])
-// CHECK: %[[EXP:.*]] = tensor.expand_shape %[[CALL]]
-// CHECK: %[[INS:.*]] = tensor.insert_slice %[[EXP]] into %arg4
-// CHECK: scf.yield %[[INS]]
-func.func @batch_existing_input(%arg0: tensor<4x8x32xf32>, %arg1: tensor<4x32x16xf32>, %arg2: tensor<4x8x16xf32>) -> tensor<4x8x16xf32> {
-  %0 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 0, 1>} : (tensor<4x8x32xf32>, tensor<4x32x16xf32>, tensor<4x8x16xf32>) -> tensor<4x8x16xf32>
-  return %0 : tensor<4x8x16xf32>
+// CHECK-LABEL: func.func private @gemm_8x32x16_call0{{(_[0-9]+)?}}(
+// CHECK-SAME: tensor<8x32xi8>, tensor<32x16xi8>, tensor<8x16xi32>
+// CHECK-SAME: ) -> tensor<8x16xi32>
+// CHECK-LABEL: func.func @wide_accum(
+// CHECK: scalehls.gemm_outlined = @gemm_8x32x16_call0{{(_[0-9]+)?}}
+// CHECK: call @gemm_8x32x16_call0{{(_[0-9]+)?}}(%arg0, %arg1, %arg2) : (tensor<8x32xi8>, tensor<32x16xi8>, tensor<8x16xi32>) -> tensor<8x16xi32>
+func.func @wide_accum(%arg0: tensor<8x32xi8>, %arg1: tensor<32x16xi8>, %arg2: tensor<8x16xi32>) -> tensor<8x16xi32> {
+  %0 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 0, 1>} : (tensor<8x32xi8>, tensor<32x16xi8>, tensor<8x16xi32>) -> tensor<8x16xi32>
+  return %0 : tensor<8x16xi32>
 }
 
 // -----
 
-func.func @forward_small(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
-  %0 = "accel.gemmv"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>} : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
-  return %0 : tensor<2x2xf32>
+// CHECK-LABEL: func.func private @gemm_8x32x16_call0{{(_[0-9]+)?}}(
+// CHECK-LABEL: func.func private @gemm_4x6x5_call0(
+// CHECK-LABEL: func.func @multi_helper(
+// CHECK-SAME: scalehls.gemm_outlined_helpers = [@gemm_8x32x16_call0{{(_[0-9]+)?}}, @gemm_4x6x5_call0]
+// CHECK-NOT: scalehls.gemm_outlined =
+// CHECK: %[[CALL0:.*]] = call @gemm_8x32x16_call0{{(_[0-9]+)?}}(%arg0, %arg1) : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
+// CHECK: %[[CALL1:.*]] = call @gemm_4x6x5_call0(%arg2, %arg3) : (tensor<4x6xf32>, tensor<6x5xf32>) -> tensor<4x5xf32>
+func.func @multi_helper(%arg0: tensor<8x32xf32>, %arg1: tensor<32x16xf32>, %arg2: tensor<4x6xf32>, %arg3: tensor<6x5xf32>) -> (tensor<8x16xf32>, tensor<4x5xf32>) {
+  %0 = "accel.gemm"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>} : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
+  %1 = "accel.gemm"(%arg2, %arg3) {operand_segment_sizes = array<i32: 1, 1, 0, 0>} : (tensor<4x6xf32>, tensor<6x5xf32>) -> tensor<4x5xf32>
+  return %0, %1 : tensor<8x16xf32>, tensor<4x5xf32>
 }
 
-// TILED-FAIL: error: persistent tiled pointer ABI not implemented yet for logical output size 128 > max-elements=64
+// -----
+
+// CHECK-LABEL: func.func private @gemm_8x8x8_ip2x2x2(
+// CHECK-SAME: tensor<8x8xf32>, tensor<8x8xf32>
+// CHECK-LABEL: func.func private @gemm_8x8x8_ip2x2x2_1(
+// CHECK-SAME: tensor<8x8xf32>, tensor<8x8xf32>, tensor<8xf32>
+// CHECK-LABEL: func.func @serial_helper_contract_collision(
+// CHECK-SAME: scalehls.gemm_outlined_helpers = [@gemm_8x8x8_ip2x2x2, @gemm_8x8x8_ip2x2x2_1]
+// CHECK: %[[CALL0:.*]] = call @gemm_8x8x8_ip2x2x2(%arg0, %arg1) : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+// CHECK: %[[CALL1:.*]] = call @gemm_8x8x8_ip2x2x2_1(%arg0, %arg1, %arg2) : (tensor<8x8xf32>, tensor<8x8xf32>, tensor<8xf32>) -> tensor<8x8xf32>
+func.func @serial_helper_contract_collision(%arg0: tensor<8x8xf32>, %arg1: tensor<8x8xf32>, %arg2: tensor<8xf32>) -> (tensor<8x8xf32>, tensor<8x8xf32>) {
+  %0 = "accel.gemm"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>, scalehls.accelerator_ip_tile_size = "2x2x2", scalehls.accelerator_ip_tiling_mode = "serial"} : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+  %1 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 1, 0>, scalehls.accelerator_ip_tile_size = "2x2x2", scalehls.accelerator_ip_tiling_mode = "serial"} : (tensor<8x8xf32>, tensor<8x8xf32>, tensor<8xf32>) -> tensor<8x8xf32>
+  return %0, %1 : tensor<8x8xf32>, tensor<8x8xf32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func private @gemm_8x8x8_ip2x2x2{{(_[0-9]+)?}}(
+// CHECK-LABEL: func.func @serial_helper_cross_candidate_reuse(
+// CHECK-SAME: scalehls.gemm_outlined = @gemm_8x8x8_ip2x2x2{{(_[0-9]+)?}}
+// CHECK: %[[CALL0:.*]] = call @gemm_8x8x8_ip2x2x2{{(_[0-9]+)?}}(%arg0, %arg1) : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+// CHECK: %[[CALL1:.*]] = call @gemm_8x8x8_ip2x2x2{{(_[0-9]+)?}}(%arg0, %arg1) : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+func.func @serial_helper_cross_candidate_reuse(%arg0: tensor<8x8xf32>, %arg1: tensor<8x8xf32>) -> (tensor<8x8xf32>, tensor<8x8xf32>) {
+  %0 = "accel.gemm"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>, scalehls.accelerator_ip_tile_size = "2x2x2", scalehls.accelerator_ip_tiling_mode = "serial", scalehls.gemm_candidate_index = 0 : i64} : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+  %1 = "accel.gemm"(%arg0, %arg1) {operand_segment_sizes = array<i32: 1, 1, 0, 0>, scalehls.accelerator_ip_tile_size = "2x2x2", scalehls.accelerator_ip_tiling_mode = "serial", scalehls.gemm_candidate_index = 7 : i64} : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+  return %0, %1 : tensor<8x8xf32>, tensor<8x8xf32>
+}

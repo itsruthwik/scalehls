@@ -1,6 +1,7 @@
 // RUN: scalehls-opt -split-input-file -tile-accel-gemm="ip-size=2x2x3" %s | FileCheck %s --check-prefix=PARALLEL
 // RUN: scalehls-opt -split-input-file -tile-accel-gemm="ip-size=2x2x3 serial" %s | FileCheck %s --check-prefix=SERIAL
 // RUN: scalehls-opt -split-input-file -tile-accel-gemm="ip-size=3x2x4" %s | FileCheck %s --check-prefix=PAD
+// RUN: scalehls-opt -split-input-file -tile-accel-gemm="ip-size=2x2x3" %s | FileCheck %s --check-prefix=BIAS1D
 
 // PARALLEL-LABEL: func.func @batched_tiled(
 // PARALLEL: %[[C00:.*]] = tensor.extract_slice %arg2[0, 0, 0] [1, 2, 2] [1, 1, 1] : tensor<1x4x4xf32> to tensor<1x2x2xf32>
@@ -45,5 +46,20 @@ func.func @batched_tiled(%arg0: tensor<1x4x6xf32>, %arg1: tensor<1x6x4xf32>, %ar
 // PAD: return %[[SLICE]] : tensor<1x4x4xf32>
 func.func @non_divisible(%arg0: tensor<1x4x6xf32>, %arg1: tensor<1x6x4xf32>, %arg2: tensor<1x4x4xf32>) -> tensor<1x4x4xf32> {
   %0 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 0, 1>} : (tensor<1x4x6xf32>, tensor<1x6x4xf32>, tensor<1x4x4xf32>) -> tensor<1x4x4xf32>
+  return %0 : tensor<1x4x4xf32>
+}
+
+// -----
+
+// BIAS1D-LABEL: func.func @batched_rank1_bias(
+// BIAS1D: %[[BCAST:.*]] = linalg.generic
+// BIAS1D-SAME: ins(%arg2 : tensor<4xf32>)
+// BIAS1D: %[[BIAS00:.*]] = tensor.extract_slice %[[BCAST]][0, 0, 0] [1, 2, 2] [1, 1, 1] : tensor<1x4x4xf32> to tensor<1x2x2xf32>
+// BIAS1D: ins(%[[BIAS00]], {{.*}} : tensor<1x2x2xf32>, tensor<1x2x2xf32>)
+// BIAS1D: scalehls.accelerator_ip_tile_k = 1 : i64
+// BIAS1D: scalehls.accelerator_ip_tile_row = 1 : i64
+// BIAS1D: scalehls.accelerator_ip_tile_col = 1 : i64
+func.func @batched_rank1_bias(%arg0: tensor<1x4x6xf32>, %arg1: tensor<1x6x4xf32>, %arg2: tensor<4xf32>) -> tensor<1x4x4xf32> {
+  %0 = "accel.gemm"(%arg0, %arg1, %arg2) {operand_segment_sizes = array<i32: 1, 1, 1, 0>} : (tensor<1x4x6xf32>, tensor<1x6x4xf32>, tensor<4xf32>) -> tensor<1x4x4xf32>
   return %0 : tensor<1x4x4xf32>
 }
