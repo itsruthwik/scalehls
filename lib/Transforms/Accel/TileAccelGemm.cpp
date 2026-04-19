@@ -108,6 +108,45 @@ static Value padTensorWithZeros(OpBuilder &builder, Location loc, Value tensor,
                            tensorType.getShape());
 }
 
+static Value broadcastRank1BiasToResultShape(OpBuilder &builder, Location loc,
+                                             Value bias,
+                                             ArrayRef<int64_t> resultShape) {
+  auto biasType = cast<RankedTensorType>(bias.getType());
+  auto resultType =
+      RankedTensorType::get(resultShape, biasType.getElementType());
+  Value empty =
+      builder.create<tensor::EmptyOp>(loc, resultShape, biasType.getElementType());
+  auto biasMap = AffineMap::get(3, 0, {builder.getAffineDimExpr(2)},
+                                builder.getContext());
+  auto resultMap = AffineMap::getMultiDimIdentityMap(3, builder.getContext());
+  return builder
+      .create<linalg::GenericOp>(
+          loc, resultType, ValueRange{bias}, ValueRange{empty},
+          ArrayRef<AffineMap>{biasMap, resultMap},
+          ArrayRef<StringRef>{"parallel", "parallel", "parallel"},
+          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
+          })
+      .getResult(0);
+}
+
+static FailureOr<Value> materializeTiledBias(OpBuilder &builder, Location loc,
+                                             Value bias,
+                                             ArrayRef<int64_t> paddedResultShape) {
+  auto biasType = dyn_cast<RankedTensorType>(bias.getType());
+  if (!biasType || !biasType.hasStaticShape())
+    return failure();
+  if (biasType.getRank() == 3)
+    return padTensorWithZeros(builder, loc, bias, paddedResultShape);
+  if (biasType.getRank() != 1)
+    return failure();
+
+  Value paddedBias = padTensorWithZeros(builder, loc, bias,
+                                        ArrayRef<int64_t>{paddedResultShape[2]});
+  return broadcastRank1BiasToResultShape(builder, loc, paddedBias,
+                                         paddedResultShape);
+}
+
 static Value insertStaticSlice(OpBuilder &builder, Location loc, Value source,
                                Value dest, ArrayRef<int64_t> offsets,
                                ArrayRef<int64_t> sizes) {
@@ -222,10 +261,23 @@ private:
     Value bias = gemmOp.getBias();
     if (bias) {
       auto biasType = dyn_cast<RankedTensorType>(bias.getType());
-      if (!biasType || !biasType.hasStaticShape() || biasType.getRank() != 3 ||
-          biasType.getShape() != resultShape) {
+      if (!biasType || !biasType.hasStaticShape()) {
         return gemmOp.emitError()
-               << "GEMM IP tiling currently requires bias to match the full result shape";
+               << "GEMM IP tiling requires bias to be a static ranked tensor";
+      }
+      if (biasType.getRank() == 3) {
+        if (biasType.getShape() != resultShape) {
+          return gemmOp.emitError()
+                 << "GEMM IP tiling requires rank-matched bias to match the full result shape";
+        }
+      } else if (biasType.getRank() == 1) {
+        if (biasType.getShape()[0] != resultShape[2]) {
+          return gemmOp.emitError()
+                 << "GEMM IP tiling requires rank-1 bias length to match the GEMM N dimension";
+        }
+      } else {
+        return gemmOp.emitError()
+               << "GEMM IP tiling requires bias to be rank-1 or match the full result shape";
       }
     }
 
@@ -259,9 +311,16 @@ private:
         padTensorWithZeros(builder, loc, gemmOp.getInput(), paddedInputShape);
     Value paddedWeight =
         padTensorWithZeros(builder, loc, gemmOp.getWeight(), paddedWeightShape);
-    Value paddedBias =
-        bias ? padTensorWithZeros(builder, loc, bias, paddedResultShape)
-             : Value();
+    Value paddedBias;
+    if (bias) {
+      auto materializedBias =
+          materializeTiledBias(builder, loc, bias, paddedResultShape);
+      if (failed(materializedBias)) {
+        return gemmOp.emitError()
+               << "GEMM IP tiling failed to materialize tiled bias";
+      }
+      paddedBias = *materializedBias;
+    }
     Value paddedExistingInput =
         existingInput
             ? padTensorWithZeros(builder, loc, existingInput, paddedResultShape)

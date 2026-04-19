@@ -44,9 +44,14 @@ public:
             vector::TransferReadOp, vector::TransferWriteOp,
             vector::BroadcastOp,
 
+            // Tensor and bufferization statements.
+            tensor::EmptyOp, bufferization::ToTensorOp,
+            bufferization::ToMemrefOp,
+
             // Memref statements.
             memref::AllocOp, memref::AllocaOp, memref::LoadOp, memref::StoreOp,
-            memref::DeallocOp, memref::CopyOp, memref::ReshapeOp,
+            memref::DeallocOp, memref::CopyOp, memref::SubViewOp,
+            memref::ReshapeOp,
             memref::CollapseShapeOp, memref::ExpandShapeOp,
             memref::ReinterpretCastOp,
 
@@ -140,6 +145,11 @@ public:
   HANDLE(vector::TransferWriteOp);
   HANDLE(vector::BroadcastOp);
 
+  // Tensor and bufferization statements.
+  HANDLE(tensor::EmptyOp);
+  HANDLE(bufferization::ToTensorOp);
+  HANDLE(bufferization::ToMemrefOp);
+
   // Memref statements.
   HANDLE(memref::AllocOp);
   HANDLE(memref::AllocaOp);
@@ -147,6 +157,7 @@ public:
   HANDLE(memref::StoreOp);
   HANDLE(memref::DeallocOp);
   HANDLE(memref::CopyOp);
+  HANDLE(memref::SubViewOp);
   HANDLE(memref::ReshapeOp);
   HANDLE(memref::CollapseShapeOp);
   HANDLE(memref::ExpandShapeOp);

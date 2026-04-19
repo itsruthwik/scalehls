@@ -47,6 +47,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print subprocess commands to stderr",
     )
+    parser.add_argument(
+        "--ip-size",
+        help="GEMM IP tile size as MxNxK for accel pipeline mode",
+    )
+    parser.add_argument(
+        "--serial",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse one tiled GEMM helper across all output tiles in accel pipeline mode",
+    )
+    parser.add_argument(
+        "--allow-large-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow affine semantic GEMM normalization to materialize large operand temporaries; pass --no-allow-large-normalization to enable conservative size-aware skipping",
+    )
+    parser.add_argument(
+        "--max-normalized-operand-elements",
+        type=int,
+        help="Maximum operand temporary elements allowed before conservative size-aware skipping rejects normalization",
+    )
     return parser
 
 
@@ -60,6 +81,10 @@ def main(argv: list[str] | None = None) -> int:
         pipeline_mode=args.pipeline_mode,
         axi_interface=args.axi_interface,
         print_commands=args.print_commands,
+        ip_size=args.ip_size,
+        serial=args.serial,
+        allow_large_normalization=args.allow_large_normalization,
+        max_normalized_operand_elements=args.max_normalized_operand_elements,
     )
     write_result_json(result)
 

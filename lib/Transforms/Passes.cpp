@@ -47,17 +47,13 @@ struct ScaleHLSCAccelPipelineOptions
       *this, "top-func", llvm::cl::init("main"),
       llvm::cl::desc("Specify the top function of the design")};
 
-  Option<std::string> manifestDir{
-      *this, "manifest-dir", llvm::cl::init(""),
-      llvm::cl::desc("Directory for per-mapped-accelerator manifest JSON files")};
+  Option<std::string> manifestFile{
+      *this, "manifest-file", llvm::cl::init(""),
+      llvm::cl::desc("Path for consolidated accelerator manifest JSON file")};
 
-  Option<std::string> candidateLog{
-      *this, "candidate-log", llvm::cl::init(""),
-      llvm::cl::desc("Path for aggregate accelerator candidate log JSON file")};
-
-  Option<unsigned> maxElements{
-      *this, "max-elements", llvm::cl::init(0),
-      llvm::cl::desc("Maximum logical output elements for untiled pointer lowering; 0 disables the threshold")};
+  Option<std::string> candidateReport{
+      *this, "candidate-report", llvm::cl::init(""),
+      llvm::cl::desc("Path for human-readable accelerator mapping report text file")};
 
   Option<std::string> ipSize{
       *this, "ip-size", llvm::cl::init(""),
@@ -67,9 +63,14 @@ struct ScaleHLSCAccelPipelineOptions
       *this, "serial", llvm::cl::init(false),
       llvm::cl::desc("Mark tiled accel.gemm ops for serial helper reuse")};
 
-  Option<bool> gemmOnly{
-      *this, "gemm-only", llvm::cl::init(false),
-      llvm::cl::desc("Disable GEMMV/CONV accel formation and lower supported cases through GEMM semantics instead")};
+  Option<bool> allowLargeNormalization{
+      *this, "allow-large-normalization", llvm::cl::init(true),
+      llvm::cl::desc("Allow affine semantic GEMM normalization to materialize large operand temporaries; set to false to enable conservative size-aware skipping")};
+
+  Option<unsigned> maxNormalizedOperandElements{
+      *this, "max-normalized-operand-elements", llvm::cl::init(4096),
+      llvm::cl::desc("Maximum operand temporary elements allowed before conservative size-aware skipping rejects normalization; 0 disables the threshold")};
+
 };
 } // namespace
 
@@ -97,18 +98,19 @@ void scalehls::registerScaleHLSCAccelPipeline() {
       "Lower canonical C/C++ affine accelerator regions into pointer-call form",
       [](OpPassManager &pm, const ScaleHLSCAccelPipelineOptions &opts) {
         pm.addPass(scalehls::createFuncPreprocessPass(opts.hlsTopFunc));
-        pm.addPass(scalehls::createLowerAffineToAccelPass(opts.gemmOnly));
+        pm.addPass(scalehls::createLowerAffineToAccelPass(
+            opts.allowLargeNormalization, opts.maxNormalizedOperandElements));
         pm.addPass(scalehls::createTileAccelGemmPass(opts.ipSize,
                                                      opts.serial));
-        pm.addPass(scalehls::createLowerAccelToCallsPass(opts.maxElements));
-        if (!opts.manifestDir.empty() || !opts.candidateLog.empty())
-          pm.addPass(scalehls::createExportAccelReportPass(opts.manifestDir,
-                                                           opts.candidateLog));
+        pm.addPass(scalehls::createLowerAccelToCallsPass());
         pm.addPass(mlir::createLinalgBufferizePass());
         pm.addPass(arith::createArithBufferizePass());
         pm.addPass(mlir::createTensorBufferizePass());
         pm.addPass(func::createFuncBufferizePass());
         pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+        if (!opts.manifestFile.empty() || !opts.candidateReport.empty())
+          pm.addPass(scalehls::createExportAccelReportPass(opts.manifestFile,
+                                                           opts.candidateReport));
         pm.addPass(scalehls::createFoldEmptyTensorToMemrefAllocPass());
         pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
         pm.addPass(scalehls::createLowerCopyToAffinePass(false));
@@ -255,17 +257,13 @@ struct ScaleFlowPyTorchGemmPipelineOptions
       *this, "fake-quantize", llvm::cl::init(false),
       llvm::cl::desc("Trigger the fake quantization (just for testing use)")};
 
-  Option<std::string> manifestDir{
-      *this, "manifest-dir", llvm::cl::init(""),
-      llvm::cl::desc("Directory for per-mapped-accelerator manifest JSON files")};
+  Option<std::string> manifestFile{
+      *this, "manifest-file", llvm::cl::init(""),
+      llvm::cl::desc("Path for consolidated accelerator manifest JSON file")};
 
-  Option<std::string> candidateLog{
-      *this, "candidate-log", llvm::cl::init(""),
-      llvm::cl::desc("Path for aggregate accelerator candidate log JSON file")};
-
-  Option<unsigned> maxElements{
-      *this, "max-elements", llvm::cl::init(0),
-      llvm::cl::desc("Maximum logical output elements for untiled pointer lowering; 0 disables the threshold")};
+  Option<std::string> candidateReport{
+      *this, "candidate-report", llvm::cl::init(""),
+      llvm::cl::desc("Path for human-readable accelerator mapping report text file")};
 
   Option<std::string> ipSize{
       *this, "ip-size", llvm::cl::init(""),
@@ -286,9 +284,8 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
                                               const PipelineOptions &opts,
                                               bool enableGemmMapper,
                                               bool createLinalgDataflow = true,
-                                              StringRef manifestDir = "",
-                                              StringRef candidateLog = "",
-                                              unsigned maxElements = 0,
+                                              StringRef manifestFile = "",
+                                              StringRef candidateReport = "",
                                               StringRef ipSize = "",
                                               bool serial = false) {
   const bool runAccelMapper = enableGemmMapper;
@@ -325,10 +322,7 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   if (runAccelMapper) {
     pm.addPass(scalehls::createLowerLinalgToAccelPass());
     pm.addPass(scalehls::createTileAccelGemmPass(ipSize.str(), serial));
-    pm.addPass(scalehls::createLowerAccelToCallsPass(maxElements));
-    if (!manifestDir.empty() || !candidateLog.empty())
-      pm.addPass(scalehls::createExportAccelReportPass(manifestDir.str(),
-                                                       candidateLog.str()));
+    pm.addPass(scalehls::createLowerAccelToCallsPass());
     pm.addPass(mlir::createCanonicalizerPass());
   }
 
@@ -341,6 +335,9 @@ static void buildScaleFlowPyTorchPipelineBody(OpPassManager &pm,
   pm.addPass(mlir::createTensorBufferizePass());
   pm.addPass(func::createFuncBufferizePass());
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+  if (runAccelMapper && (!manifestFile.empty() || !candidateReport.empty()))
+    pm.addPass(scalehls::createExportAccelReportPass(manifestFile.str(),
+                                                     candidateReport.str()));
   pm.addPass(scalehls::createFoldEmptyTensorToMemrefAllocPass());
   pm.addPass(scalehls::createBufferizeDataflowPass());
   pm.addPass(mlir::createCanonicalizerPass());
@@ -485,8 +482,8 @@ void scalehls::registerScaleFlowPyTorchAccelPipeline() {
       [](OpPassManager &pm, const ScaleFlowPyTorchGemmPipelineOptions &opts) {
         buildScaleFlowPyTorchPipelineBody(pm, opts, /*enableGemmMapper=*/true,
                                           /*createLinalgDataflow=*/false,
-                                          opts.manifestDir, opts.candidateLog,
-                                          opts.maxElements, opts.ipSize,
+                                          opts.manifestFile, opts.candidateReport,
+                                          opts.ipSize,
                                           opts.serial);
       });
 }

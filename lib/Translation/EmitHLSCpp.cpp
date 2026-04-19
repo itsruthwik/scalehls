@@ -264,6 +264,8 @@ public:
 
   /// Memref-related statement emitters.
   template <typename OpType> void emitAlloc(OpType op);
+  void emitSubview(memref::SubViewOp op);
+  template <typename OpType> void emitAlias(OpType op);
   void emitLoad(memref::LoadOp op);
   void emitStore(memref::StoreOp op);
   void emitMemCpy(memref::CopyOp op);
@@ -289,6 +291,7 @@ private:
   /// C++ component emitters.
   void emitValue(Value val, unsigned rank = 0, bool isPtr = false,
                  bool isRef = false);
+  void emitScalarDecl(Value val, bool isRef = false);
   void emitArrayDecl(Value array);
   unsigned emitNestedLoopHeader(Value val);
   void emitNestedLoopFooter(unsigned rank);
@@ -458,6 +461,11 @@ public:
     return emitter.emitBroadcast(op), true;
   };
 
+  /// Tensor and bufferization statements.
+  bool visitOp(tensor::EmptyOp op) { return emitter.emitAlloc(op), true; }
+  bool visitOp(bufferization::ToTensorOp op) { return emitter.emitAlias(op), true; }
+  bool visitOp(bufferization::ToMemrefOp op) { return emitter.emitAlias(op), true; }
+
   /// Memref statements.
   bool visitOp(memref::AllocOp op) { return emitter.emitAlloc(op), true; }
   bool visitOp(memref::AllocaOp op) { return emitter.emitAlloc(op), true; }
@@ -465,6 +473,7 @@ public:
   bool visitOp(memref::StoreOp op) { return emitter.emitStore(op), true; }
   bool visitOp(memref::DeallocOp op) { return true; }
   bool visitOp(memref::CopyOp op) { return emitter.emitMemCpy(op), true; }
+  bool visitOp(memref::SubViewOp op) { return emitter.emitSubview(op), true; }
   bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true; }
   bool visitOp(memref::CollapseShapeOp op) {
     return emitter.emitReshape(op), true;
@@ -563,6 +572,9 @@ public:
   bool visitOp(arith::ExtFOp op) { return emitter.emitAssign(op), true; }
 
   /// Memref view expressions that materialize as local aliases.
+  bool visitOp(bufferization::ToTensorOp op) { return emitter.emitAlias(op), true; }
+  bool visitOp(bufferization::ToMemrefOp op) { return emitter.emitAlias(op), true; }
+  bool visitOp(memref::SubViewOp op) { return emitter.emitSubview(op), true; }
   bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true; }
   bool visitOp(memref::CollapseShapeOp op) {
     return emitter.emitReshape(op), true;
@@ -818,11 +830,15 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   }
 
   // Handle output arguments.
+  bool needComma = op.getNumOperands() != 0;
   for (auto result : op.getResults()) {
+    if (needComma)
+      os << ", ";
     // The address should be passed in for scalar result arguments.
     if (!result.getType().isa<ShapedType>())
-      os << ", &";
+      os << "&";
     emitValue(result);
+    needComma = true;
   }
 
   os << ");";
@@ -831,6 +847,42 @@ void ModuleEmitter::emitCall(func::CallOp op) {
 
 /// SCF statement emitters.
 void ModuleEmitter::emitScfFor(scf::ForOp op) {
+  for (auto [result, init] : llvm::zip(op.getResults(), op.getInitArgs())) {
+    if (!isDeclared(result)) {
+      indent();
+      if (result.getType().isa<ShapedType>())
+        emitArrayDecl(result);
+      else
+        emitScalarDecl(result);
+      os << ";\n";
+    }
+
+    unsigned rank = emitNestedLoopHeader(result);
+    indent();
+    emitValue(result, rank);
+    os << " = ";
+    emitValue(init, rank);
+    os << ";";
+    emitInfoAndNewLine(op);
+    emitNestedLoopFooter(rank);
+  }
+
+  unsigned regionArgIdx = 0;
+  for (auto regionArg : llvm::drop_begin(op.getBody()->getArguments(), 1)) {
+    if (regionArgIdx >= op.getNumResults())
+      break;
+    auto result = op.getResult(regionArgIdx++);
+    if (!isDeclared(result)) {
+      indent();
+      if (result.getType().isa<ShapedType>())
+        emitArrayDecl(result);
+      else
+        emitScalarDecl(result);
+      os << ";\n";
+    }
+    addAlias(result, regionArg);
+  }
+
   indent() << "for (";
   auto iterVar = op.getInductionVar();
 
@@ -871,7 +923,7 @@ void ModuleEmitter::emitScfIf(scf::IfOp op) {
       if (result.getType().isa<ShapedType>())
         emitArrayDecl(result);
       else
-        emitValue(result);
+        emitScalarDecl(result);
       os << ";\n";
     }
   }
@@ -913,11 +965,50 @@ void ModuleEmitter::emitScfYield(scf::YieldOp op) {
       emitInfoAndNewLine(op);
       emitNestedLoopFooter(rank);
     }
+  } else if (auto parentOp = dyn_cast<scf::ForOp>(op->getParentOp())) {
+    unsigned resultIdx = 0;
+    for (auto result : parentOp.getResults()) {
+      unsigned rank = emitNestedLoopHeader(result);
+      indent();
+      emitValue(result, rank);
+      os << " = ";
+      emitValue(op.getOperand(resultIdx++), rank);
+      os << ";";
+      emitInfoAndNewLine(op);
+      emitNestedLoopFooter(rank);
+    }
   }
 }
 
 /// Affine statement emitters.
 void ModuleEmitter::emitAffineFor(AffineForOp op) {
+  for (auto [result, init] : llvm::zip(op.getResults(), op.getIterOperands())) {
+    if (!isDeclared(result)) {
+      indent();
+      if (result.getType().isa<ShapedType>())
+        emitArrayDecl(result);
+      else
+        emitScalarDecl(result);
+      os << ";\n";
+    }
+
+    unsigned rank = emitNestedLoopHeader(result);
+    indent();
+    emitValue(result, rank);
+    os << " = ";
+    emitValue(init, rank);
+    os << ";";
+    emitInfoAndNewLine(op);
+    emitNestedLoopFooter(rank);
+  }
+
+  unsigned regionArgIdx = 0;
+  for (auto regionArg : llvm::drop_begin(op.getBody()->getArguments(), 1)) {
+    if (regionArgIdx >= op.getNumResults())
+      break;
+    addAlias(op.getResult(regionArgIdx++), regionArg);
+  }
+
   indent() << "for (";
   auto iterVar = op.getInductionVar();
 
@@ -984,7 +1075,7 @@ void ModuleEmitter::emitAffineIf(AffineIfOp op) {
       if (result.getType().isa<ShapedType>())
         emitArrayDecl(result);
       else
-        emitValue(result);
+        emitScalarDecl(result);
       os << ";\n";
     }
   }
@@ -1032,7 +1123,7 @@ void ModuleEmitter::emitAffineParallel(AffineParallelOp op) {
       if (result.getType().isa<ShapedType>())
         emitArrayDecl(result);
       else
-        emitValue(result);
+        emitScalarDecl(result);
       os << ";\n";
     }
   }
@@ -1150,9 +1241,21 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
   if (op.getNumOperands() == 0)
     return;
 
-  // For now, only AffineParallel and AffineIf operations will use
+  // For now, only AffineFor, AffineParallel and AffineIf operations will use
   // AffineYield to return generated values.
-  if (auto parentOp = dyn_cast<AffineIfOp>(op->getParentOp())) {
+  if (auto parentOp = dyn_cast<AffineForOp>(op->getParentOp())) {
+    unsigned resultIdx = 0;
+    for (auto result : parentOp.getResults()) {
+      unsigned rank = emitNestedLoopHeader(result);
+      indent();
+      emitValue(result, rank);
+      os << " = ";
+      emitValue(op.getOperand(resultIdx++), rank);
+      os << ";";
+      emitInfoAndNewLine(op);
+      emitNestedLoopFooter(rank);
+    }
+  } else if (auto parentOp = dyn_cast<AffineIfOp>(op->getParentOp())) {
     unsigned resultIdx = 0;
     for (auto result : parentOp.getResults()) {
       unsigned rank = emitNestedLoopHeader(result);
@@ -1395,7 +1498,8 @@ template <typename OpType> void ModuleEmitter::emitAlloc(OpType op) {
   emitArrayDecl(op.getResult());
   os << ";";
   emitInfoAndNewLine(op);
-  emitArrayDirectives(op.getResult());
+  if (op.getResult().getType().template isa<MemRefType>())
+    emitArrayDirectives(op.getResult());
 }
 
 void ModuleEmitter::emitLoad(memref::LoadOp op) {
@@ -1438,6 +1542,92 @@ void ModuleEmitter::emitMemCpy(memref::CopyOp op) {
      << "));";
   emitInfoAndNewLine(op);
   os << "\n";
+}
+
+template <typename OpType> void ModuleEmitter::emitAlias(OpType op) {
+  auto source = op->getOperand(0);
+  auto result = op->getResult(0);
+  if (!isDeclared(source)) {
+    emitError(op, "has undeclared alias source.");
+    return;
+  }
+  addAlias(source, result);
+}
+
+static SmallVector<int64_t> getStorageShape(Value value) {
+  auto shapedType = value.getType().dyn_cast<ShapedType>();
+  if (!shapedType || !shapedType.hasStaticShape())
+    return {};
+  if (auto subview = value.getDefiningOp<memref::SubViewOp>()) {
+    auto inherited = getStorageShape(subview.getSource());
+    if (!inherited.empty())
+      return inherited;
+  }
+  SmallVector<int64_t> shape(shapedType.getShape().begin(),
+                             shapedType.getShape().end());
+  return shape;
+}
+
+static bool hasAllUnitStaticStrides(memref::SubViewOp op) {
+  auto strides = getIntArrayAttrValue(op, op.getStaticStridesAttrName());
+  return llvm::all_of(strides, [](int64_t stride) { return stride == 1; });
+}
+
+void ModuleEmitter::emitSubview(memref::SubViewOp op) {
+  auto resultType = op.getResult().getType().dyn_cast<MemRefType>();
+  if (!resultType || !resultType.hasStaticShape()) {
+    emitError(op, "is unranked or has dynamic shape.");
+    return;
+  }
+  if (!hasAllUnitStaticStrides(op)) {
+    emitError(op, "has unsupported non-unit subview strides.");
+    return;
+  }
+
+  auto storageShape = getStorageShape(op.getSource());
+  if (storageShape.empty()) {
+    emitError(op, "has unsupported subview source shape.");
+    return;
+  }
+  if (storageShape.size() < static_cast<size_t>(resultType.getRank())) {
+    emitError(op, "has invalid subview storage rank.");
+    return;
+  }
+
+  indent() << getTypeName(op.getResult()) << " (*";
+  os << addName(op.getResult());
+  os << ")";
+
+  size_t trailingCount =
+      resultType.getRank() > 0 ? static_cast<size_t>(resultType.getRank() - 1) : 0;
+  auto trailingStorage =
+      llvm::ArrayRef<int64_t>(storageShape).take_back(trailingCount);
+  for (int64_t dim : trailingStorage)
+    os << "[" << dim << "]";
+
+  os << " = (" << getTypeName(op.getResult()) << " (*)";
+  for (int64_t dim : trailingStorage)
+    os << "[" << dim << "]";
+  os << ") &";
+  emitValue(op.getSource());
+
+  for (OpFoldResult offset : op.getMixedOffsets()) {
+    os << "[";
+    if (auto attr = offset.dyn_cast<Attribute>()) {
+      auto intAttr = attr.dyn_cast<IntegerAttr>();
+      if (!intAttr) {
+        emitError(op, "has unsupported subview offset attribute.");
+        return;
+      }
+      os << intAttr.getInt();
+    } else {
+      emitValue(offset.get<Value>());
+    }
+    os << "]";
+  }
+
+  os << ";";
+  emitInfoAndNewLine(op);
 }
 
 template <typename OpType> void ModuleEmitter::emitReshape(OpType op) {
@@ -1594,6 +1784,14 @@ void ModuleEmitter::emitValue(Value val, unsigned rank, bool isPtr,
   os << addName(val, isPtr);
   for (unsigned i = 0; i < rank; ++i)
     os << "[iv" << i << "]";
+}
+
+void ModuleEmitter::emitScalarDecl(Value val, bool isRef) {
+  assert(!isDeclared(val) && "has been declared before.");
+  os << getTypeName(val) << " ";
+  if (isRef)
+    os << "&";
+  os << addName(val);
 }
 
 void ModuleEmitter::emitArrayDecl(Value array) {
@@ -1900,29 +2098,61 @@ void ModuleEmitter::emitFunctionDecl(func::FuncOp func) {
     if (current + 1 != total)
       os << ",\n";
   };
+  auto getAccelPortName = [&](unsigned argIdx) -> StringRef {
+    if (!func->hasAttr("scalehls.gemm"))
+      return {};
+    auto matchesArg = [&](StringRef attrName) {
+      if (auto attr = func->getAttrOfType<IntegerAttr>(attrName))
+        return attr.getInt() == static_cast<int64_t>(argIdx);
+      return false;
+    };
+    if (matchesArg("scalehls.gemm_a_arg"))
+      return StringRef("A");
+    if (matchesArg("scalehls.gemm_b_arg"))
+      return StringRef("B");
+    if (matchesArg("scalehls.gemm_bias_arg"))
+      return StringRef("Bias");
+    if (matchesArg("scalehls.gemm_existing_input_arg"))
+      return StringRef("ExistingInput");
+    if (matchesArg("scalehls.gemm_c_arg"))
+      return StringRef("C");
+    if (argIdx == 0)
+      return StringRef("A");
+    if (argIdx == 1)
+      return StringRef("B");
+    return {};
+  };
 
   unsigned totalPorts = func.getNumArguments() + func.getNumResults();
   for (auto [argIdx, argType] : llvm::enumerate(func.getArgumentTypes())) {
     indent();
+    StringRef portName = getAccelPortName(argIdx);
     if (auto shapedType = dyn_cast<ShapedType>(argType)) {
-      os << getTypeName(argType) << " arg" << argIdx;
+      os << getTypeName(argType) << " "
+         << (portName.empty() ? ("arg" + std::to_string(argIdx)) : portName.str());
       for (auto dim : shapedType.getShape())
         os << "[" << dim << "]";
     } else if (argType.isa<StreamType>()) {
-      os << "hls::stream<" << getTypeName(argType) << "> &arg" << argIdx;
+      os << "hls::stream<" << getTypeName(argType) << "> &"
+         << (portName.empty() ? ("arg" + std::to_string(argIdx)) : portName.str());
     } else {
-      os << getTypeName(argType) << " arg" << argIdx;
+      os << getTypeName(argType) << " "
+         << (portName.empty() ? ("arg" + std::to_string(argIdx)) : portName.str());
     }
     emitPortSeparator(portIdx++, totalPorts);
   }
   for (auto [resultIdx, resultType] : llvm::enumerate(func.getResultTypes())) {
     indent();
     if (auto shapedType = dyn_cast<ShapedType>(resultType)) {
-      os << getTypeName(resultType) << " result" << resultIdx;
+      std::string resultName =
+          func->hasAttr("scalehls.gemm") ? "C" : "result" + std::to_string(resultIdx);
+      os << getTypeName(resultType) << " " << resultName;
       for (auto dim : shapedType.getShape())
         os << "[" << dim << "]";
     } else {
-      os << getTypeName(resultType) << " *result" << resultIdx;
+      std::string resultName =
+          func->hasAttr("scalehls.gemm") ? "C" : "result" + std::to_string(resultIdx);
+      os << getTypeName(resultType) << " *" << resultName;
     }
     emitPortSeparator(portIdx++, totalPorts);
   }

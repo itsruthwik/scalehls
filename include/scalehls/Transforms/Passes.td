@@ -40,14 +40,14 @@ def FuncDuplication : Pass<"scalehls-func-duplication", "mlir::ModuleOp"> {
 }
 
 def ExportAccelReport : Pass<"export-accel-report", "ModuleOp"> {
-  let summary = "Export accelerator manifests for mapped kernels and a candidate log";
+  let summary = "Export a consolidated accelerator manifest and human-readable mapping report";
   let constructor = "mlir::scalehls::createExportAccelReportPass()";
 
   let options = [
-    Option<"manifestDir", "manifest-dir", "std::string", /*default=*/"\"\"",
-           "Directory for per-mapped-accelerator manifest JSON files">,
-    Option<"candidateLog", "candidate-log", "std::string", /*default=*/"\"\"",
-           "Path for aggregate accelerator candidate log JSON file">
+    Option<"manifestFile", "manifest-file", "std::string", /*default=*/"\"\"",
+           "Path for consolidated accelerator manifest JSON file">,
+    Option<"candidateReport", "candidate-report", "std::string", /*default=*/"\"\"",
+           "Path for human-readable accelerator mapping report text file">
   ];
 }
 
@@ -207,17 +207,21 @@ def LinalgAnalyzeModel : Pass<"scalehls-linalg-analyze-model", "func::FuncOp"> {
 
 def LowerLinalgToAccel :
       Pass<"lower-linalg-to-accel", "func::FuncOp"> {
-  let summary = "Lower mapped tensor/linalg family patterns into accel dialect ops";
+  let summary = "Lower mapped tensor/linalg GEMM patterns into accel dialect ops";
   let constructor = "mlir::scalehls::createLowerLinalgToAccelPass()";
 }
 
 def LowerAffineToAccel :
       Pass<"lower-affine-to-accel", "func::FuncOp"> {
-  let summary = "Lower strict affine GEMM patterns into accel dialect ops";
+  let summary = "Lower supported affine GEMM patterns into accel dialect ops";
   let constructor = "mlir::scalehls::createLowerAffineToAccelPass()";
   let options = [
-    Option<"gemmOnly", "gemm-only", "bool", /*default=*/"false",
-           "Disable GEMMV/CONV accel formation and lower supported cases through GEMM semantics instead">
+    Option<"allowLargeNormalization", "allow-large-normalization", "bool",
+           /*default=*/"true",
+           "Allow semantic operand normalization even when it requires large temporary buffers; set to false to enable conservative size-aware skipping">,
+    Option<"maxNormalizedOperandElements", "max-normalized-operand-elements",
+           "unsigned", /*default=*/"4096",
+           "Maximum operand temporary elements allowed before conservative size-aware skipping rejects normalization; 0 disables the threshold">
   ];
 }
 
@@ -237,10 +241,6 @@ def LowerAccelToCalls :
       Pass<"lower-accel-to-calls", "mlir::ModuleOp"> {
   let summary = "Lower accel dialect ops into the default array-argument physical ABI form";
   let constructor = "mlir::scalehls::createLowerAccelToCallsPass()";
-  let options = [
-    Option<"maxElements", "max-elements", "unsigned", /*default=*/"0",
-           "Maximum logical output elements for untiled pointer lowering; 0 disables the threshold">
-  ];
 }
 
 def LinalgFakeQuantize : Pass<"scalehls-linalg-fake-quantize", "ModuleOp"> {

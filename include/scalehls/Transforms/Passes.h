@@ -42,8 +42,9 @@ void addSimplifyAffineLoopPasses(OpPassManager &pm);
 std::unique_ptr<Pass>
 createDesignSpaceExplorePass(std::string dseTargetSpec = "");
 std::unique_ptr<Pass> createFuncDuplicationPass();
-std::unique_ptr<Pass> createExportAccelReportPass(std::string manifestDir = "",
-                                                  std::string candidateLog = "");
+std::unique_ptr<Pass>
+createExportAccelReportPass(std::string manifestFile = "",
+                            std::string candidateReport = "");
 std::unique_ptr<Pass>
 createFuncPreprocessPass(std::string hlsTopFunc = "forward");
 
@@ -72,10 +73,12 @@ std::unique_ptr<Pass> createStreamDataflowTaskPass();
 /// Tensor-related passes.
 std::unique_ptr<Pass> createConvertTensorToLinalgPass();
 std::unique_ptr<Pass> createLinalgAnalyzeModelPass();
-std::unique_ptr<Pass> createLowerAffineToAccelPass(bool gemmOnly = false);
+std::unique_ptr<Pass>
+createLowerAffineToAccelPass(bool allowLargeNormalization = true,
+                             unsigned maxNormalizedOperandElements = 4096);
 std::unique_ptr<Pass> createTileAccelGemmPass(std::string ipSize = "",
                                               bool serial = false);
-std::unique_ptr<Pass> createLowerAccelToCallsPass(unsigned maxElements = 0);
+std::unique_ptr<Pass> createLowerAccelToCallsPass();
 std::unique_ptr<Pass> createLowerLinalgToAccelPass();
 std::unique_ptr<Pass> createLinalgFakeQuantizePass();
 std::unique_ptr<Pass> createTosaFakeQuantizePass();

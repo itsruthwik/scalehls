@@ -40,50 +40,11 @@ static bool isSimpleAddGeneric(linalg::GenericOp generic) {
   if (generic.getBody()->getOperations().size() != 2)
     return false;
   auto add = dyn_cast<arith::AddFOp>(generic.getBody()->front());
+  auto addi = dyn_cast<arith::AddIOp>(generic.getBody()->front());
   auto yield = dyn_cast<linalg::YieldOp>(generic.getBody()->getTerminator());
-  return add && yield && yield.getValues().size() == 1 &&
-         yield.getValues().front() == add.getResult();
-}
-
-static bool isBiasBroadcastGeneric(linalg::GenericOp generic) {
-  if (!generic || generic.getNumInputs() != 1 || generic.getNumOutputs() != 1)
-    return false;
-  auto inputType = dyn_cast<ShapedType>(generic.getInputs()[0].getType());
-  auto outputType = dyn_cast<ShapedType>(generic.getOutputs()[0].getType());
-  if (!inputType || !outputType || !inputType.hasStaticShape() ||
-      !outputType.hasStaticShape())
-    return false;
-  if (inputType.getRank() != 1 || outputType.getRank() < 2)
-    return false;
-  if (generic.getBody()->getOperations().size() != 1)
-    return false;
-  auto yield = dyn_cast<linalg::YieldOp>(generic.getBody()->getTerminator());
-  if (!yield || yield.getValues().size() != 1 ||
-      yield.getValues().front() != generic.getBody()->getArgument(0))
-    return false;
-  auto maps = generic.getIndexingMapsArray();
-  if (maps.size() != 2 || !maps[1].isIdentity())
-    return false;
-  auto inputMap = maps[0];
-  if (inputMap.getNumResults() != 1)
-    return false;
-  auto dimExpr = inputMap.getResult(0).dyn_cast<AffineDimExpr>();
-  return dimExpr && dimExpr.getPosition() == 1;
-}
-
-static bool allOnes(DenseIntElementsAttr attr) {
-  for (APInt value : attr.getValues<APInt>()) {
-    if (value.getSExtValue() != 1)
-      return false;
-  }
-  return true;
-}
-
-static SmallVector<int64_t, 4> toIntVector(DenseIntElementsAttr attr) {
-  SmallVector<int64_t, 4> values;
-  for (APInt value : attr.getValues<APInt>())
-    values.push_back(value.getSExtValue());
-  return values;
+  return yield && yield.getValues().size() == 1 &&
+         ((add && yield.getValues().front() == add.getResult()) ||
+          (addi && yield.getValues().front() == addi.getResult()));
 }
 
 static bool hasStaticShape(Value value) {
@@ -107,8 +68,6 @@ struct CandidateInfo {
   Value existingInput;
   Value finalResult;
   StringRef family;
-  DenseI64ArrayAttr strides;
-  DenseI64ArrayAttr dilations;
 };
 
 static LogicalResult classifyAdditiveOperand(Value additive, Value result,
@@ -211,8 +170,7 @@ static FailureOr<CandidateInfo> matchMatmulCandidate(Operation *baseOp,
   info.input = input;
   info.weight = weight;
   info.finalResult = result;
-  info.family = resultType.getRank() <= 2 ? StringRef("GEMMV")
-                                          : StringRef("GEMM");
+  info.family = StringRef("GEMM");
 
   if (auto addUser = findSimpleAddUser(result)) {
     Value additive =
@@ -231,50 +189,8 @@ static FailureOr<CandidateInfo> matchMatmulCandidate(Operation *baseOp,
   return info;
 }
 
-static FailureOr<CandidateInfo> matchConvCandidate(linalg::Conv2DNchwFchwOp conv) {
-  auto weightType = dyn_cast<RankedTensorType>(conv.getInputs()[1].getType());
-  auto resultType = dyn_cast<RankedTensorType>(conv.getResult(0).getType());
-  if (!weightType || !resultType || !weightType.hasStaticShape() ||
-      !resultType.hasStaticShape() || weightType.getRank() != 4)
-    return failure();
-
-  CandidateInfo info;
-  info.baseOp = conv;
-  info.input = conv.getInputs()[0];
-  info.weight = conv.getInputs()[1];
-  info.finalResult = conv.getResult(0);
-
-  Value init = conv.getOutputs()[0];
-  if (auto biasInit = init.getDefiningOp<linalg::GenericOp>();
-      biasInit && isBiasBroadcastGeneric(biasInit))
-    info.bias = biasInit.getInputs()[0];
-
-  if (auto addUser = findSimpleAddUser(conv.getResult(0))) {
-    Value additive = addUser.getInputs()[0] == conv.getResult(0)
-                         ? addUser.getInputs()[1]
-                         : addUser.getInputs()[0];
-    if (failed(classifyAdditiveOperand(additive, addUser.getResult(0),
-                                       info.bias, info.existingInput)))
-      return failure();
-    info.absorbedAdd = addUser;
-    info.finalResult = addUser.getResult(0);
-  }
-
-  bool isOneByOne = weightType.getDimSize(2) == 1 &&
-                    weightType.getDimSize(3) == 1 && allOnes(conv.getDilations());
-  info.family = isOneByOne ? StringRef("GEMM") : StringRef("CONV");
-  info.strides = DenseI64ArrayAttr::get(conv.getContext(),
-                                        toIntVector(conv.getStrides()));
-  info.dilations = DenseI64ArrayAttr::get(conv.getContext(),
-                                          toIntVector(conv.getDilations()));
-
-  if (!hasStaticShape(info.input) || !hasStaticShape(info.weight) ||
-      !hasStaticShape(info.finalResult))
-    return failure();
-  return info;
-}
-
-static FailureOr<CandidateInfo> matchCandidate(Operation *op) {
+static FailureOr<CandidateInfo> matchCandidate(Operation *op,
+                                               std::string &skipReason) {
   if (auto matmul = dyn_cast<linalg::MatmulOp>(op))
     return matchMatmulCandidate(matmul, matmul.getInputs()[0],
                                 matmul.getInputs()[1], matmul.getResult(0));
@@ -282,8 +198,16 @@ static FailureOr<CandidateInfo> matchCandidate(Operation *op) {
     return matchMatmulCandidate(batchMatmul, batchMatmul.getInputs()[0],
                                 batchMatmul.getInputs()[1],
                                 batchMatmul.getResult(0));
-  if (auto conv = dyn_cast<linalg::Conv2DNchwFchwOp>(op))
-    return matchConvCandidate(conv);
+  if (isa<linalg::Conv2DNchwFchwOp>(op)) {
+    skipReason =
+        "unsupported linalg accel candidate: conv_2d_nchw_fchw remains tensor-side only";
+    return failure();
+  }
+  if (isa<linalg::LinalgOp>(op)) {
+    skipReason =
+        "unsupported linalg accel candidate: only matmul and batch_matmul contracts are lowered";
+    return failure();
+  }
   return failure();
 }
 
@@ -310,43 +234,30 @@ struct LowerLinalgToAccel
 
     int64_t candidateIndex = 0;
     bool mappedAny = false;
+    std::string firstSkipReason;
+    auto recordSkipReason = [&](StringRef reason) {
+      if (firstSkipReason.empty() && !reason.empty())
+        firstSkipReason = reason.str();
+    };
     for (Operation *baseOp : bases) {
       if (!baseOp || baseOp->getBlock() == nullptr)
         continue;
 
-      auto candidate = matchCandidate(baseOp);
-      if (failed(candidate))
+      std::string candidateSkipReason;
+      auto candidate = matchCandidate(baseOp, candidateSkipReason);
+      if (failed(candidate)) {
+        recordSkipReason(candidateSkipReason);
         continue;
+      }
 
       OpBuilder builder(candidate->absorbedAdd ? candidate->absorbedAdd : baseOp);
-      Value lowered;
-      if (candidate->family == "GEMMV") {
-        lowered = builder
-                      .create<accel::GEMMVOp>(builder.getUnknownLoc(),
-                                              candidate->finalResult.getType(),
-                                              candidate->input, candidate->weight,
-                                              candidate->bias,
-                                              candidate->existingInput)
-                      .getResult();
-      } else if (candidate->family == "GEMM") {
-        lowered = builder
-                      .create<accel::GEMMOp>(builder.getUnknownLoc(),
-                                             candidate->finalResult.getType(),
-                                             candidate->input, candidate->weight,
-                                             candidate->bias,
-                                             candidate->existingInput)
-                      .getResult();
-      } else {
-        lowered = builder
-                      .create<accel::CONVOp>(builder.getUnknownLoc(),
-                                             candidate->finalResult.getType(),
-                                             candidate->input, candidate->weight,
-                                             candidate->bias,
-                                             candidate->existingInput,
-                                             candidate->strides,
-                                             candidate->dilations)
-                      .getResult();
-      }
+      Value lowered =
+          builder
+              .create<accel::GEMMOp>(baseOp->getLoc(),
+                                     candidate->finalResult.getType(),
+                                     candidate->input, candidate->weight,
+                                     candidate->bias, candidate->existingInput)
+              .getResult();
 
       auto *loweredOp = lowered.getDefiningOp();
       annotateCandidateAttrs(loweredOp, *candidate);
@@ -364,7 +275,11 @@ struct LowerLinalgToAccel
       baseOp->erase();
     }
 
-    if (mappedAny)
+    if (!firstSkipReason.empty())
+      func->setAttr(
+          kSkipReasonAttr,
+          StringAttr::get(func.getContext(), firstSkipReason));
+    else if (mappedAny)
       func->removeAttr(kSkipReasonAttr);
     else
       func->setAttr(kSkipReasonAttr,

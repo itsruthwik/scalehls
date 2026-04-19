@@ -170,8 +170,13 @@ def normalize_file(input_path: Path, output_path: Path) -> list[RewriteRule]:
 
 
 OUTLINED_SYMBOL_RE = re.compile(r"scalehls\.gemm_outlined = @([A-Za-z_0-9$.]+)")
+OUTLINED_SYMBOLS_RE = re.compile(
+    r"scalehls\.gemm_outlined_helpers = \[([^\]]*)\]",
+    re.MULTILINE,
+)
+OUTLINED_HELPER_REF_RE = re.compile(r"@([A-Za-z_0-9$.]+)")
 SKIP_REASON_RE = re.compile(r'scalehls\.gemm_skip_reason = "([^"]+)"')
-ACCEL_OP_RE = re.compile(r'"accel\.(gemmv|gemm|conv)"')
+ACCEL_OP_RE = re.compile(r'"accel\.gemm"')
 
 
 @dataclass(frozen=True)
@@ -182,8 +187,8 @@ class CArtifactLayout:
     optimized_mlir: Path
     mapped_mlir: Path
     emitted_cpp: Path
-    candidate_log: Path
-    manifest_dir: Path
+    candidate_report: Path
+    manifest_file: Path
     cgeist_stderr: Path
     opt_stderr: Path
     mapper_stderr: Path
@@ -211,8 +216,8 @@ class CFrontendRunResult:
     mapped_mlir: str | None = None
     optimized_mlir: str | None = None
     emitted_cpp: str | None = None
-    candidate_log: str | None = None
-    manifest_dir: str | None = None
+    candidate_report: str | None = None
+    manifest_file: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -234,8 +239,8 @@ class CFrontendRunResult:
             "mapped_mlir": self.mapped_mlir,
             "optimized_mlir": self.optimized_mlir,
             "emitted_cpp": self.emitted_cpp,
-            "candidate_log": self.candidate_log,
-            "manifest_dir": self.manifest_dir,
+            "candidate_report": self.candidate_report,
+            "manifest_file": self.manifest_file,
         }
 
 
@@ -247,8 +252,8 @@ def build_artifact_layout(output_root: Path, stem: str) -> CArtifactLayout:
         optimized_mlir=output_root / "mlir_opt" / f"{stem}.mlir",
         mapped_mlir=output_root / "mlir_mapped" / f"{stem}.mlir",
         emitted_cpp=output_root / "cpp" / f"{stem}.cpp",
-        candidate_log=output_root / "gemm_reports" / "candidate_logs" / f"{stem}.json",
-        manifest_dir=output_root / "gemm_reports" / "manifests" / stem,
+        candidate_report=output_root / "gemm_reports" / "report.txt",
+        manifest_file=output_root / "gemm_reports" / "manifest.json",
         cgeist_stderr=output_root / "logs" / f"{stem}_cgeist.stderr",
         opt_stderr=output_root / "logs" / f"{stem}_opt.stderr",
         mapper_stderr=output_root / "logs" / f"{stem}_gemm_mapper.stderr",
@@ -258,7 +263,10 @@ def build_artifact_layout(output_root: Path, stem: str) -> CArtifactLayout:
 
 
 def parse_mapped_symbols(mlir_text: str) -> list[str]:
-    return sorted(set(OUTLINED_SYMBOL_RE.findall(mlir_text)))
+    symbols = set(OUTLINED_SYMBOL_RE.findall(mlir_text))
+    for match in OUTLINED_SYMBOLS_RE.findall(mlir_text):
+        symbols.update(OUTLINED_HELPER_REF_RE.findall(match))
+    return sorted(symbols)
 
 
 def parse_skip_reason(mlir_text: str) -> str | None:
@@ -270,11 +278,47 @@ def has_accel_ops(mlir_text: str) -> bool:
     return ACCEL_OP_RE.search(mlir_text) is not None
 
 
-def load_candidate_entries(candidate_log: Path) -> list[dict]:
-    if not candidate_log.exists():
+def load_manifest_helpers(manifest_file: Path) -> list[dict]:
+    if not manifest_file.exists():
         return []
-    data = json.loads(candidate_log.read_text(encoding="utf-8"))
-    return data.get("candidates", [])
+    data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    return data.get("helpers", [])
+
+
+def _entry_from_manifest_helper(helper: dict) -> dict:
+    entry = {
+        "function": helper.get("function"),
+        "status": "mapped",
+        "symbol": helper.get("symbol"),
+        "candidate_index": helper.get("call_index"),
+        "family": "GEMM",
+    }
+    if helper.get("gemm") is not None:
+        entry["gemm_dimensions"] = helper["gemm"]
+
+    sizes = helper.get("sizes", {})
+    if "A" in sizes:
+        entry["A"] = {"shape": sizes.get("A")}
+        entry["inputs"] = dict(entry["A"])
+    if "B" in sizes:
+        entry["B"] = {"shape": sizes.get("B")}
+        entry["weights"] = dict(entry["B"])
+    if "C" in sizes:
+        entry["C"] = {"shape": sizes.get("C")}
+        entry["outputs"] = dict(entry["C"])
+        if sizes.get("C") is not None:
+            entry["shape"] = sizes["C"]
+    if "Bias" in sizes:
+        entry["bias"] = {"shape": sizes.get("Bias")}
+    if "ExistingInput" in sizes:
+        entry["existing_input"] = {"shape": sizes.get("ExistingInput")}
+    if helper.get("precision") is not None:
+        entry["precision"] = helper["precision"]
+    return entry
+
+
+def load_candidate_entries(manifest_file: Path) -> list[dict]:
+    return [_entry_from_manifest_helper(helper) for helper in load_manifest_helpers(manifest_file)]
 
 
 def first_candidate_for(entries: list[dict], top_func: str) -> dict | None:
@@ -305,6 +349,10 @@ def run_c_frontend(
     pipeline_mode: str = "default",
     axi_interface: bool = False,
     print_commands: bool = False,
+    ip_size: str | None = None,
+    serial: bool = False,
+    allow_large_normalization: bool = True,
+    max_normalized_operand_elements: int | None = None,
 ) -> CFrontendRunResult:
     resolved_repo_root = find_repo_root(repo_root)
     resolved_input = input_path.resolve()
@@ -316,6 +364,7 @@ def run_c_frontend(
     )
     output_root.mkdir(parents=True, exist_ok=True)
     layout = build_artifact_layout(output_root, resolved_input.stem)
+    shutil.rmtree(output_root / "gemm_reports", ignore_errors=True)
     result = CFrontendRunResult(
         input_path=resolved_input,
         top_func=selected_top_func,
@@ -325,8 +374,8 @@ def run_c_frontend(
         mapped_mlir=str(layout.mapped_mlir),
         optimized_mlir=str(layout.optimized_mlir),
         emitted_cpp=str(layout.emitted_cpp),
-        candidate_log=str(layout.candidate_log),
-        manifest_dir=str(layout.manifest_dir),
+        candidate_report=str(layout.candidate_report),
+        manifest_file=str(layout.manifest_file),
         mapped_symbols=[],
         candidate_entries=[],
         manifest_paths=[],
@@ -405,16 +454,29 @@ def run_c_frontend(
 
     if pipeline_mode == "accel":
         mapper = resolve_tool("scalehls-opt", resolved_repo_root)
+        pipeline = (
+            "-c-accel-pipeline="
+            f"top-func={selected_top_func} "
+            f"manifest-file={layout.manifest_file} "
+            f"candidate-report={layout.candidate_report}"
+        )
+        if ip_size:
+            pipeline += f" ip-size={ip_size}"
+        if serial:
+            pipeline += " serial=true"
+        pipeline += (
+            f" allow-large-normalization={'true' if allow_large_normalization else 'false'}"
+        )
+        if max_normalized_operand_elements is not None:
+            pipeline += (
+                " max-normalized-operand-elements="
+                f"{max_normalized_operand_elements}"
+            )
         try:
             run_command(
                 [
                     str(mapper),
-                    (
-                        "-c-accel-pipeline="
-                        f"top-func={selected_top_func} "
-                        f"manifest-dir={layout.manifest_dir} "
-                        f"candidate-log={layout.candidate_log}"
-                    ),
+                    pipeline,
                     str(layout.frontend_mlir),
                 ],
                 cwd=resolved_repo_root,
@@ -431,15 +493,56 @@ def run_c_frontend(
                 stderr_path=layout.mapper_stderr,
             )
 
+        cleaned_mapped = layout.mapped_mlir.with_suffix(".clean.mlir")
+        try:
+            run_command(
+                [
+                    str(mapper),
+                    str(layout.mapped_mlir),
+                    "-scalehls-fold-static-subview-into-affine",
+                    "-canonicalize",
+                ],
+                cwd=resolved_repo_root,
+                stdout_path=cleaned_mapped,
+                stderr_path=layout.mapper_stderr,
+                print_commands=print_commands,
+            )
+            cleaned_mapped.replace(layout.mapped_mlir)
+        except CommandFailure as exc:
+            return _record_failure(
+                result,
+                stage="mapper-cleanup",
+                fallback_message=str(exc),
+                stderr_path=layout.mapper_stderr,
+            )
+
         mapped_text = layout.mapped_mlir.read_text(encoding="utf-8")
-        result.mapped_symbols = parse_mapped_symbols(mapped_text)
+        result.candidate_entries = load_candidate_entries(layout.manifest_file)
+        candidate_symbols = sorted(
+            {
+                entry["symbol"]
+                for entry in result.candidate_entries
+                if entry.get("status") == "mapped" and entry.get("symbol")
+            }
+        )
+        result.mapped_symbols = candidate_symbols or parse_mapped_symbols(mapped_text)
         result.mapped = bool(result.mapped_symbols)
-        result.candidate_entries = load_candidate_entries(layout.candidate_log)
         candidate = first_candidate_for(result.candidate_entries, selected_top_func)
-        if candidate is not None and candidate.get("skip_reason"):
+        if candidate is None and result.skip_reason is None:
+            skip_reason = parse_skip_reason(mapped_text)
+            if skip_reason:
+                result.skip_reason = skip_reason
+                result.candidate_entries = [
+                    {
+                        "function": selected_top_func,
+                        "status": "unmapped",
+                        "skip_reason": skip_reason,
+                    }
+                ]
+        elif candidate is not None and candidate.get("skip_reason"):
             result.skip_reason = candidate["skip_reason"]
-        result.manifest_paths = sorted(
-            str(path) for path in layout.manifest_dir.glob("*.json")
+        result.manifest_paths = (
+            [str(layout.manifest_file)] if layout.manifest_file.exists() else []
         )
 
         try:
